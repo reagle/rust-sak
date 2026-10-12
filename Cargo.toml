@@ -70,6 +70,14 @@ postcard = { version = "1.1.3", default-features = false, features = ["use-std"]
 # Only the `crossterm` backend: `tui` draws one inline line, and the default `all-widgets`, `macros` and
 # `underline-color` set is all unused here.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
+# Named only for `scrolling-regions`, which `tui` does not use, but which adds two required methods to ratatui's
+# `Backend` trait. `tui` implements that trait, so the feature is turned on in every build: otherwise a consumer that
+# enables it elsewhere in its graph (features unify) would leave `tui`'s backend missing them. Turned on here rather
+# than through `ratatui`, whose feature also names its other backends and so puts them all in the lock file.
+ratatui-crossterm = { version = "0.1.2", default-features = false, features = [
+    "crossterm_0_29",
+    "scrolling-regions",
+], optional = true }
 redb = { version = "4.2.0", default-features = false, optional = true }
 reqwest = { version = "0.13.4", features = ["query", "json", "stream"], optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
@@ -208,7 +216,7 @@ sysinfo = [
     "dep:windows",
 ]
 # A one-line gradient progress bar drawn with `ratatui` in an inline viewport, on stdout or stderr.
-tui = ["dep:libc", "dep:ratatui"]
+tui = ["dep:libc", "dep:ratatui", "dep:ratatui-crossterm"]
 
 # Mirrors the `required-features` the `playground` target carried as a `[[bin]]`: without this, a
 # build with any other feature set tries to compile it and fails on the missing `fetch` module.

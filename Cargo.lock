@@ -3281,6 +3281,7 @@ dependencies = [
  "pin-project-lite",
  "postcard",
  "ratatui",
+ "ratatui-crossterm",
  "rayon",
  "redb",
  "reqwest",

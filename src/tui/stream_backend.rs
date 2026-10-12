@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::ops::Range;
 
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Cell;
@@ -88,6 +89,14 @@ impl<W: Write> Backend for StreamBackend<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         Backend::flush(&mut self.inner)
+    }
+
+    fn scroll_region_up(&mut self, region: Range<u16>, line_count: u16) -> io::Result<()> {
+        self.inner.scroll_region_up(region, line_count)
+    }
+
+    fn scroll_region_down(&mut self, region: Range<u16>, line_count: u16) -> io::Result<()> {
+        self.inner.scroll_region_down(region, line_count)
     }
 }
 
