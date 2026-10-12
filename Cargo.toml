@@ -67,6 +67,9 @@ moka = { version = "0.12.16", default-features = false, features = ["sync"], opt
 o11y-macros = { path = "macros", optional = true }
 pin-project-lite = { version = "0.2.17", optional = true }
 postcard = { version = "1.1.3", default-features = false, features = ["use-std"], optional = true }
+# Only the `crossterm` backend: `tui` draws one inline line, and the default `all-widgets`, `macros` and
+# `underline-color` set is all unused here.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 redb = { version = "4.2.0", default-features = false, optional = true }
 reqwest = { version = "0.13.4", features = ["query", "json", "stream"], optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
@@ -122,6 +125,11 @@ objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std",
 # Only Windows, Linux and the BSDs: on macOS `fs` reaches the Trash through `objc2-foundation` above.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 trash = { version = "5.2.9", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# `poll`, for `tui` to wait on the terminal's reply to a cursor-position query with a timeout. crossterm already brings
+# it in, so it adds no crate.
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `dl_iterate_phdr` and the `RTLD_NOLOAD`/`RTLD_NODELETE` flags, which pin the drivers the WebGPU probe loads. The flag
@@ -199,9 +207,15 @@ sysinfo = [
     "dep:thiserror",
     "dep:windows",
 ]
+# A one-line gradient progress bar drawn with `ratatui` in an inline viewport, on stdout or stderr.
+tui = ["dep:libc", "dep:ratatui"]
 
 # Mirrors the `required-features` the `playground` target carried as a `[[bin]]`: without this, a
 # build with any other feature set tries to compile it and fails on the missing `fetch` module.
 [[example]]
 name = "playground"
 required-features = ["fetch"]
+
+[[example]]
+name = "tui"
+required-features = ["tui"]

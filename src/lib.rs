@@ -1,7 +1,7 @@
 //! `rust-sak` — a "Swiss Army Knife" of reusable Rust building blocks.
 //!
 //! The crate is organized into independent modules (e.g. [`fetch`], [`crypto`], [`fs`], [`github`], [`image`], [`memo`],
-//! [`o11y`], [`sysinfo`]), each gated behind its own Cargo feature so consumers compile only what they need:
+//! [`o11y`], [`sysinfo`], [`tui`]), each gated behind its own Cargo feature so consumers compile only what they need:
 //!
 //! ```toml
 //! rust-sak = { git = "https://github.com/vegidio/rust-sak", features = ["fetch"] }
@@ -32,3 +32,5 @@ pub mod memo;
 pub mod o11y;
 #[cfg(feature = "sysinfo")]
 pub mod sysinfo;
+#[cfg(feature = "tui")]
+pub mod tui;

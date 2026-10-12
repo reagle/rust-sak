@@ -1,6 +1,6 @@
 # rust-sak
 
-A "Swiss Army Knife" of reusable Rust building blocks: hashing, HTTP fetching, hardened archive extraction, image codecs, memoization, OTLP telemetry and hardware probes.
+A "Swiss Army Knife" of reusable Rust building blocks: hashing, HTTP fetching, hardened archive extraction, image codecs, memoization, OTLP telemetry, hardware probes and a terminal progress bar.
 
 ## ⬇️ Installation
 
@@ -37,6 +37,7 @@ The crate is a collection of independent modules, each gated behind its own Carg
 | `o11y`         | [`o11y`](src/o11y/README.md)       | Logs, metrics and traces to an OpenTelemetry collector over OTLP, exported on a background thread                | no              |
 | `o11y-tracing` |                                    | Adds a `tracing` layer that forwards events and spans to `o11y`, parented by `tracing`'s own span tree           | no              |
 | `sysinfo`      | [`sysinfo`](src/sysinfo/README.md) | CPU, memory, GPU and CUDA probes, asked through each platform's own interface — no subprocesses                  | no              |
+| `tui`          | [`tui`](src/tui/README.md)         | A one-line gradient progress bar, animated in an inline terminal viewport on stdout or stderr                   | no              |
 
 Each module's README covers its API and guarantees in full; the same content is rendered in the [API documentation](https://docs.rs/rust-sak).
 

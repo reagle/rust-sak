@@ -95,6 +95,7 @@ jobs:
           - o11y
           - o11y-tracing
           - sysinfo
+          - tui
     steps:
       - uses: actions/checkout@v7
 

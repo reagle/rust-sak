@@ -447,3 +447,62 @@ mod image_raw {
         ));
     }
 }
+
+#[cfg(feature = "tui")]
+mod tui {
+    use std::time::Duration;
+
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::text::Line;
+    use ratatui::widgets::Widget;
+    use rust_sak::tui::{AnimatedProgress, GradientBar, Live, LiveLine, ProgressLine, Spring, Target, format_eta};
+
+    #[test]
+    fn the_widgets_render_from_outside() {
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        ProgressLine {
+            label: "Upscale",
+            fraction: 0.5,
+            position: 0.5,
+            eta: Some(None),
+            ..ProgressLine::default()
+        }
+        .render(area, &mut buf);
+        GradientBar {
+            position: 1.0,
+            color: false,
+        }
+        .render(area, &mut buf);
+
+        let mut spring = Spring::default();
+        spring.target = 1.0;
+        spring.step();
+        assert!(spring.position > 0.0);
+        assert_eq!(format_eta(Some(Duration::from_secs(65))), "1m5s");
+    }
+
+    #[test]
+    fn a_caller_can_draw_a_line_of_its_own() {
+        // Both shipped lines, and a third one written outside the crate, satisfy what `Live` needs.
+        struct Blank;
+        impl LiveLine for Blank {
+            fn render(&mut self, _: Rect, _: &mut Buffer) {}
+        }
+        fn is_live_line<L: LiveLine>(_: &L) {}
+
+        is_live_line(&Blank);
+        is_live_line(&AnimatedProgress::new("Upscale"));
+        is_live_line(&Line::from("Downloading"));
+    }
+
+    #[test]
+    fn a_session_needs_a_terminal() {
+        // Under the test harness stdout is captured, so it is not one; the error is what a caller checks for.
+        if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            let err = Live::start(Target::Stdout, Line::from("x"), || {}).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        }
+    }
+}
