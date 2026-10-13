@@ -227,3 +227,7 @@ required-features = ["fetch"]
 [[example]]
 name = "tui"
 required-features = ["tui"]
+
+[[example]]
+name = "tui_rows"
+required-features = ["tui"]

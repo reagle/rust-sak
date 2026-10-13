@@ -1,6 +1,6 @@
 # `tui` module
 
-A one-line terminal progress display, drawn with [`ratatui`](https://ratatui.rs) in an inline viewport so it stays in the normal scrollback instead of taking over the screen:
+A terminal progress display, one line by default, drawn with [`ratatui`](https://ratatui.rs) in an inline viewport so it stays in the normal scrollback instead of taking over the screen:
 
 ```text
 Upscale         [1/2]  █████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░   50.0%   ETA 4.2s
@@ -46,7 +46,7 @@ use rust_sak::tui::{AnimatedProgress, Live, LiveHandle, LiveLine, Target};
 | Item               | Signature                                                                                                  | What it does                                                                                                                                  |
 |--------------------|------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
 | `Target`           | `enum Target { Stdout, Stderr }`                                                                           | The stream the session draws on.                                                                                                              |
-| `LiveLine`         | `trait LiveLine: Send + 'static { fn render(&mut self, Rect, &mut Buffer); fn settled(&self) -> bool; fn snap(&mut self); }` | What a session draws. `settled` and `snap` default to "always settled" and nothing, for a line that does not animate.                         |
+| `LiveLine`         | `trait LiveLine: Send + 'static { fn render(&mut self, Rect, &mut Buffer); fn settled(&self) -> bool; fn snap(&mut self); fn height(&self) -> u16; }` | What a session draws. `settled` and `snap` default to "always settled" and nothing, for a line that does not animate; `height` defaults to one row. |
 | `AnimatedProgress` | `struct AnimatedProgress { label, label_width, counter, fraction, eta, color, .. }`, a `LiveLine`          | A `ProgressLine` whose bar springs towards `fraction`, while the percentage shows `fraction` at once. Settled once the bar arrives.            |
 | `Line<'static>`    | `impl LiveLine for ratatui::text::Line<'static>`                                                           | A plain line of text, drawn as it is.                                                                                                         |
 | `Live`             | `Live::start(target, line, on_interrupt: impl Fn() + Send + 'static) -> io::Result<Live<L>>`               | Puts the terminal in raw mode and starts drawing `line` on the cursor's row.                                                                  |
@@ -55,7 +55,15 @@ use rust_sak::tui::{AnimatedProgress, Live, LiveHandle, LiveLine, Target};
 |                    | `.finish(self) -> io::Result<()>`                                                                          | Lets the line settle (up to the cap, then snaps it), draws the last frame and restores the terminal, leaving the cursor on the line below.     |
 | `LiveHandle`       | `.update(&self, impl FnOnce(&mut L) -> R) -> R`; `Clone + Send + Sync`                                     | Changes the line; the next frame draws it. The line is locked while the closure runs, so it should only set fields.                          |
 
-## Usage
+### More than one row
+
+A `LiveLine` that returns more than `1` from `height` gets that many rows: a bar over a status list, say, split with ratatui's `Layout` inside `render`.
+
+- **The height is fixed for the session's life.** `Live::start` reads it once; changing what `height` returns afterwards does nothing. A line that will need up to five list rows asks for them from the start, and the rows it has nothing for yet are drawn blank, as empty lines under the drawing.
+- **`render` is given the rows there are.** In a terminal shorter than the height, the `Rect` is clamped to the terminal's height, so the line must clip rather than assume its full height. `Layout` does this.
+- **Starting near the bottom of the window scrolls the terminal up** to make room, as any inline viewport does. Nothing in the scrollback is overwritten.
+- `0` is treated as `1`: the viewport needs a row to anchor to.
+
 
 Progress on **stderr**, so stdout stays free for the program's results, updated from a worker thread:
 
@@ -93,7 +101,7 @@ eprintln!("Done");
 # }
 ```
 
-`cargo run --example tui --features tui` runs a version of this; `--stdout`, `--drop` and `--panic` show the other stream and the other ways a session ends.
+`cargo run --example tui --features tui` runs a version of this; `--stdout`, `--drop` and `--panic` show the other stream and the other ways a session ends. `cargo run --example tui_rows --features tui` draws a bar over a five-row list that scrolls to the most recent item, and takes `--drop` and `--panic` too.
 
 ## Rules for the caller
 
@@ -103,7 +111,7 @@ eprintln!("Done");
 
 ## Guarantees
 
-- **The terminal is restored however the session ends**: `finish`, dropping the `Live`, an error while drawing, or a panic that unwinds. Raw mode is turned off, the cursor is shown, and it is left on the line below the last frame (or below whatever was printed past it).
+- **The terminal is restored however the session ends**: `finish`, dropping the `Live`, an error while drawing, or a panic that unwinds. Raw mode is turned off, the cursor is shown, and it is left on the line below the last frame's bottom row (or below whatever was printed past it).
 - **A panic prints its message in raw mode.** The panic hook runs before unwinding reaches the session, and this module does not replace the application's hook, so the message is drawn without carriage returns. The shell's prompt still comes back on a clean line. Under `panic = "abort"` nothing runs at all, and the terminal is left in raw mode.
 - **The cursor position is asked for on the target stream.** An inline viewport needs to know the cursor's row. crossterm asks for it on stdout on Unix, so this module asks on the target stream itself and reads the terminal's reply directly. A session on stderr then works with stdout redirected, and writes nothing to it.
 

@@ -1,12 +1,12 @@
-//! A one-line terminal progress display.
+//! A terminal progress display, one line by default.
 //!
 //! - [`GradientBar`], [`ProgressLine`] and [`format_eta`] draw the line: `Loading   [1/2]  ████░░░░  50.0%   ETA 4.2s`,
 //!   with the bar's cells running through a colour gradient.
 //! - [`Spring`] eases the bar towards its target, one frame at a time.
 //! - [`LiveLine`] is what a live session draws: [`AnimatedProgress`], a plain [`Line`](ratatui::text::Line), or a
 //!   line of the caller's own.
-//! - [`Live`] draws a [`LiveLine`] on stdout or stderr until it is finished, and [`LiveHandle`] changes it from
-//!   any thread.
+//! - [`Live`] draws a [`LiveLine`], on as many rows as it asks for, on stdout or stderr until it is finished, and
+//!   [`LiveHandle`] changes it from any thread.
 //!
 //! ```no_run
 //! use rust_sak::tui::{AnimatedProgress, Live, Target};

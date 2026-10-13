@@ -9,6 +9,7 @@ use ratatui::backend::Backend;
 use ratatui::crossterm::cursor::{MoveTo, Show};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::{execute, terminal};
+use ratatui::layout::Rect;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use super::stream_backend::StreamBackend;
@@ -65,10 +66,12 @@ impl Write for Stream {
     }
 }
 
-/// A [`LiveLine`] drawn on one terminal row, in raw mode, up to 60 times a second, by a thread of its own.
+/// A [`LiveLine`] drawn on [`LiveLine::height`] terminal rows, in raw mode, up to 60 times a second, by a thread of
+/// its own.
 ///
-/// The row is an inline viewport: it stays in the normal scrollback rather than taking over the screen, and after
-/// [`finish`](Self::finish) its last frame is left there with the cursor on the line below.
+/// The rows are an inline viewport: they stay in the normal scrollback rather than taking over the screen, and after
+/// [`finish`](Self::finish) the last frame is left there with the cursor on the line below it. The height is read
+/// once, at [`start`](Self::start); in a shorter terminal the line is given, and clipped to, the rows there are.
 ///
 /// - Producers change the line through a [`LiveHandle`], from any thread or async task.
 /// - Raw mode turns Ctrl-C into a key press instead of a signal, on every platform. Each press calls the
@@ -88,7 +91,8 @@ pub struct Live<L: LiveLine> {
 }
 
 impl<L: LiveLine> Live<L> {
-    /// Starts drawing `line` on `target`, on the row the cursor is on.
+    /// Starts drawing `line` on `target`, from the row the cursor is on. When fewer than [`LiveLine::height`] rows
+    /// are left below it, the terminal scrolls up to make room.
     ///
     /// # Errors
     ///
@@ -106,7 +110,7 @@ impl<L: LiveLine> Live<L> {
             ));
         }
 
-        let session = Session::start(target)?;
+        let session = Session::start(target, line.height())?;
         let line = Arc::new(Mutex::new(line));
         let (finish, finished) = mpsc::channel();
 
@@ -295,21 +299,23 @@ impl Drop for RawMode {
     }
 }
 
-/// The terminal in raw mode with a one-row inline viewport. Dropping it restores the terminal and leaves the cursor
-/// on the line below the viewport.
+/// The terminal in raw mode with an inline viewport. Dropping it restores the terminal and leaves the cursor on the
+/// line below the viewport.
 struct Session {
     terminal: Terminal<StreamBackend<Stream>>,
     _raw_mode: RawMode,
 }
 
 impl Session {
-    fn start(target: Target) -> io::Result<Self> {
+    fn start(target: Target, height: u16) -> io::Result<Self> {
         // Raw mode first: the inline viewport asks the terminal where the cursor is, and the reply must not be echoed.
         let raw_mode = RawMode::enable()?;
+        let backend = StreamBackend::new(target.stream());
+        let rows = backend.size()?.height;
         let terminal = Terminal::with_options(
-            StreamBackend::new(target.stream()),
+            backend,
             TerminalOptions {
-                viewport: Viewport::Inline(1),
+                viewport: viewport(height, rows),
             },
         )?;
         Ok(Self {
@@ -323,15 +329,27 @@ impl Drop for Session {
     fn drop(&mut self) {
         // Below the viewport, or below whatever was written past it: a panic's message is printed by the panic hook
         // before unwinding gets here, still in raw mode. Asked while raw mode is on, so the reply is not echoed.
-        let viewport = self.terminal.get_frame().area().y;
+        let area = self.terminal.get_frame().area();
         let out = self.terminal.backend_mut();
-        let row = out
-            .get_cursor_position()
-            .map_or(viewport, |cursor| cursor.y.max(viewport));
+        let row = restore_row(area, out.get_cursor_position().ok().map(|cursor| cursor.y));
 
         let _ = terminal::disable_raw_mode();
         let _ = execute!(out, MoveTo(0, row), Show);
         let _ = writeln!(out);
         let _ = Write::flush(out);
     }
+}
+
+/// The inline viewport for a line `height` rows tall, in a terminal `rows` rows tall. ratatui needs at least one row
+/// to anchor the cursor. It clamps the viewport to the terminal itself, but scrolls by the height it was asked for,
+/// which would push blank lines into the scrollback; clamping here first scrolls only by the rows there are.
+pub(super) fn viewport(height: u16, rows: u16) -> Viewport {
+    Viewport::Inline(height.min(rows).max(1))
+}
+
+/// The row the cursor goes to before the restoring newline: the viewport's bottom row, or the cursor's own row when
+/// something was written further down.
+pub(super) fn restore_row(viewport: Rect, cursor: Option<u16>) -> u16 {
+    let bottom = viewport.bottom().saturating_sub(1).max(viewport.y);
+    cursor.map_or(bottom, |row| row.max(bottom))
 }

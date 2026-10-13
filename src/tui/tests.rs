@@ -474,3 +474,72 @@ fn the_cursor_reply_is_parsed_zero_based() {
     assert_eq!(parse_reply(b"\x1b[12;"), None, "an incomplete reply waits for more");
     assert_eq!(parse_reply(b""), None);
 }
+
+#[test]
+fn existing_lines_are_one_row_tall() {
+    assert_eq!(LiveLine::height(&AnimatedProgress::new("Upscale")), 1);
+    assert_eq!(LiveLine::height(&ratatui::text::Line::from("💾 Downloading")), 1);
+}
+
+/// A line of a fixed height that records the area of every frame it is given.
+struct Rows {
+    height: u16,
+    areas: Vec<Rect>,
+}
+
+impl LiveLine for Rows {
+    fn render(&mut self, area: Rect, _buf: &mut Buffer) {
+        self.areas.push(area);
+    }
+
+    fn height(&self) -> u16 {
+        self.height
+    }
+}
+
+/// Draws one frame of `line` on a `TestBackend` of `rows` rows, in the viewport a session would use, and returns
+/// the area the line was given.
+fn session_area(height: u16, rows: u16) -> Rect {
+    let mut line = Rows {
+        height,
+        areas: Vec::new(),
+    };
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(40, rows),
+        ratatui::TerminalOptions {
+            viewport: live::viewport(line.height(), rows),
+        },
+    )
+    .unwrap();
+    terminal
+        .draw(|frame| line.render(frame.area(), frame.buffer_mut()))
+        .unwrap();
+    line.areas[0]
+}
+
+#[test]
+fn a_taller_line_gets_that_many_rows() {
+    assert_eq!(session_area(3, 10).height, 3);
+}
+
+#[test]
+fn a_zero_height_line_gets_one_row() {
+    assert_eq!(session_area(0, 10).height, 1);
+}
+
+#[test]
+fn a_line_taller_than_the_terminal_gets_the_terminal() {
+    assert_eq!(session_area(7, 4).height, 4);
+}
+
+#[test]
+fn the_terminal_is_restored_below_the_bottom_row() {
+    assert_eq!(live::restore_row(Rect::new(0, 5, 40, 1), None), 5, "one row, as before");
+    assert_eq!(live::restore_row(Rect::new(0, 5, 40, 7), None), 11);
+    assert_eq!(live::restore_row(Rect::new(0, 5, 40, 7), Some(5)), 11);
+    assert_eq!(
+        live::restore_row(Rect::new(0, 5, 40, 7), Some(14)),
+        14,
+        "below a panic message printed past the viewport"
+    );
+}
