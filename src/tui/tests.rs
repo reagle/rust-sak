@@ -436,6 +436,76 @@ fn a_plain_line_draws_its_text_and_is_always_settled() {
     assert_eq!(buf[(3, 0)].symbol(), "D");
 }
 
+// --- Spinner ---
+
+const CLOCKWISE: [&str; 8] = ["⣾", "⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽"];
+
+fn spinner_turning(direction: Direction) -> Spinner {
+    let mut spinner = Spinner::new();
+    spinner.direction = direction;
+    spinner
+}
+
+fn spinner_frames(spinner: &Spinner) -> Vec<&'static str> {
+    (0..8)
+        .map(|i| spinner.frame_at(Duration::from_millis(i * 100)))
+        .collect()
+}
+
+#[test]
+fn spinner_turns_clockwise_by_default() {
+    assert_eq!(spinner_frames(&Spinner::new()), CLOCKWISE);
+}
+
+#[test]
+fn spinner_counter_clockwise_matches_bubbles_dot() {
+    assert_eq!(
+        spinner_frames(&spinner_turning(Direction::CounterClockwise)),
+        ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
+    );
+}
+
+#[test]
+fn spinner_holds_each_frame_for_100_ms_and_wraps() {
+    for direction in [Direction::Clockwise, Direction::CounterClockwise] {
+        let spinner = spinner_turning(direction);
+        let at = |ms| spinner.frame_at(Duration::from_millis(ms));
+
+        assert_eq!(at(799), at(700), "{direction:?}");
+        assert_eq!(at(800), "⣾", "{direction:?}");
+        assert_eq!(at(850), at(50), "{direction:?}");
+    }
+}
+
+#[test]
+fn spinner_span_is_styled_only_with_color() {
+    let mut spinner = Spinner::new();
+    spinner.style = Style::new().fg(Color::Rgb(0xc7, 0x92, 0xe9));
+
+    assert_eq!(spinner.span().style, spinner.style);
+
+    spinner.color = false;
+    assert_eq!(spinner.span().style, Style::new());
+}
+
+#[test]
+fn spinner_default_style_is_the_gradient_end() {
+    assert_eq!(Spinner::new().style.fg, Some(Color::Rgb(0xee, 0x6f, 0xf8)));
+}
+
+#[test]
+fn spinner_widget_draws_its_glyph() {
+    let spinner = Spinner::new();
+    let mut terminal = Terminal::new(TestBackend::new(1, 1)).unwrap();
+
+    terminal
+        .draw(|frame| frame.render_widget(&spinner, frame.area()))
+        .unwrap();
+
+    let symbol = terminal.backend().buffer()[(0, 0)].symbol().to_owned();
+    assert!(CLOCKWISE.contains(&symbol.as_str()), "drew {symbol:?}");
+}
+
 // --- Live ---
 
 #[test]

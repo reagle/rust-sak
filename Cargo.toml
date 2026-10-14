@@ -231,3 +231,7 @@ required-features = ["tui"]
 [[example]]
 name = "tui_rows"
 required-features = ["tui"]
+
+[[example]]
+name = "tui_spinner"
+required-features = ["tui"]

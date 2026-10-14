@@ -3,6 +3,7 @@
 //! - [`GradientBar`], [`ProgressLine`] and [`format_eta`] draw the line: `Loading   [1/2]  ████░░░░  50.0%   ETA 4.2s`,
 //!   with the bar's cells running through a colour gradient.
 //! - [`Spring`] eases the bar towards its target, one frame at a time.
+//! - [`Spinner`] is a braille spinner that turns on its own clock, for a line whose wait has no known length.
 //! - [`LiveLine`] is what a live session draws: [`AnimatedProgress`], a plain [`Line`](ratatui::text::Line), or a
 //!   line of the caller's own.
 //! - [`Live`] draws a [`LiveLine`], on as many rows as it asks for, on stdout or stderr until it is finished, and
@@ -29,6 +30,7 @@ mod gradient_bar;
 mod live;
 mod live_line;
 mod progress_line;
+mod spinner;
 mod spring;
 mod stream_backend;
 
@@ -38,6 +40,7 @@ pub use gradient_bar::GradientBar;
 pub use live::{Live, LiveHandle, Target};
 pub use live_line::LiveLine;
 pub use progress_line::ProgressLine;
+pub use spinner::{Direction, Spinner};
 pub use spring::Spring;
 
 use ratatui::style::{Color, Style};

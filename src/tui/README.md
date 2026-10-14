@@ -31,6 +31,8 @@ use rust_sak::tui::{AnimatedProgress, Live, LiveHandle, LiveLine, Target};
 | `GradientBar` | `struct GradientBar { position, color }`, a `Widget`                                                    | The bar alone: `position` (0–1) of it filled with `█`, the rest `░`.                                                              |
 | `Spring`      | `struct Spring { position, target, .. }` with `step()`, `is_settled()`, `snap()`                        | The animation: one `step()` per frame moves `position` towards `target`, from rest across `0`–`1` in under a second, without overshoot. |
 | `format_eta`  | `fn format_eta(eta: Option<Duration>) -> String`                                                        | `--`, then `4.2s` below 10 s, then `12s`, `1m5s`, `1h2m3s`.                                                                        |
+| `Spinner`     | `struct Spinner { direction, style, color, .. }` with `new()`, `frame_at(Duration)`, `glyph()`, `span()`; `&Spinner` is a `Widget` | A one-cell braille spinner, `⣾ ⣷ ⣯ ⣟ ⡿ ⢿ ⣻ ⣽`, one frame every 100 ms. `style` defaults to `#ee6ff8` and applies only with `color`. |
+| `Direction`   | `enum Direction { Clockwise, CounterClockwise }`, `Clockwise` by default                                | Which way a `Spinner` turns. `CounterClockwise` is `⣾ ⣽ ⣻ ⢿ ⡿ ⣟ ⣯ ⣷`, the order of bubbles' `spinner.Dot`.                     |
 
 `ProgressLine`'s fields:
 
@@ -40,6 +42,21 @@ use rust_sak::tui::{AnimatedProgress, Live, LiveHandle, LiveLine, Target};
 - **`position`** (0–1) is how full the bar is, usually `fraction` or a value animated towards it.
 - **`eta`**: `None` leaves the ETA column out; `Some(None)` draws `ETA --`, for an estimate not known yet.
 - **`color`**: without it, the line keeps the terminal's default colours.
+
+`Spinner`'s frame comes from the time since `new()`, **10 frames a second whatever the draw rate**: a 60 fps live session and a caller that draws twice a second see it turn at the same speed, the slower one skipping frames rather than slowing down. A session redraws every frame, so a spinner inside one animates without any `update`. `frame_at` is the pure part, the frame for a given elapsed time, for tests.
+
+A spinner usually sits inside a line of text, so `span()` is the way to draw it: one span in a `Line` of the caller's own.
+
+```rust
+use ratatui::text::Line;
+use rust_sak::tui::{Direction, Spinner};
+
+let mut spinner = Spinner::new();
+spinner.direction = Direction::CounterClockwise;
+
+// Built on every draw, so the glyph is the current one.
+let line = Line::from(vec!["Downloading… ".into(), spinner.span(), " 34% Complete".into()]);
+```
 
 ### Live session
 
@@ -101,7 +118,7 @@ eprintln!("Done");
 # }
 ```
 
-`cargo run --example tui --features tui` runs a version of this; `--stdout`, `--drop` and `--panic` show the other stream and the other ways a session ends. `cargo run --example tui_rows --features tui` draws a bar over a five-row list that scrolls to the most recent item, and takes `--drop` and `--panic` too.
+`cargo run --example tui --features tui` runs a version of this; `--stdout`, `--drop` and `--panic` show the other stream and the other ways a session ends. `cargo run --example tui_rows --features tui` draws a bar over a five-row list that scrolls to the most recent item, and takes `--drop` and `--panic` too. `cargo run --example tui_spinner --features tui` turns a spinner clockwise, then counter-clockwise, inside a line of text.
 
 ## Rules for the caller
 
