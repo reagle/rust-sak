@@ -10,8 +10,8 @@
 //! fixture).
 
 mod exif;
-mod jpeg;
-mod png;
+pub(super) mod jpeg;
+pub(super) mod png;
 mod webp;
 mod xmp;
 

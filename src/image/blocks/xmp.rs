@@ -190,6 +190,11 @@ fn unwrapped(packet: &[u8]) -> &[u8] {
     packet.trim_ascii()
 }
 
+/// Whether `needle` occurs anywhere in `packet`.
+pub(super) fn contains(packet: &[u8], needle: &[u8]) -> bool {
+    find(packet, needle).is_some()
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
 }

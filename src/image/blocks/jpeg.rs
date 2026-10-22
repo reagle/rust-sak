@@ -7,12 +7,23 @@ const EOI: u8 = 0xD9;
 const SOS: u8 = 0xDA;
 const APP0: u8 = 0xE0;
 const APP1: u8 = 0xE1;
+const APP2: u8 = 0xE2;
 const APP13: u8 = 0xED;
 
 const EXIF_HEADER: &[u8] = b"Exif\0\0";
 const XMP_HEADER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 const EXTENDED_HEADER: &[u8] = b"http://ns.adobe.com/xmp/extension/\0";
 const PHOTOSHOP_HEADER: &[u8] = b"Photoshop 3.0\0";
+/// The ISO 21496-1 gain-map version marker's `APP2` header.
+const ISO_GAIN_MAP_HEADER: &[u8] = b"urn:iso:std:iso:ts:21496:-1\0";
+/// The CIPA DC-007 Multi-Picture Format `APP2` header.
+const MPF_HEADER: &[u8] = b"MPF\0";
+/// The namespace of Adobe's and Android's (Ultra HDR) gain-map XMP description, `hdrgm:`.
+const HDRGM_NAMESPACE: &[u8] = b"http://ns.adobe.com/hdr-gain-map/1.0/";
+/// MPF's `MPEntry` tag, whose value is one 16-byte entry per image.
+const MP_ENTRY: u16 = 0xB002;
+/// The MP Entry image type code of a gain map (CIPA DC-007, the low 24 bits of an entry's attribute).
+const MP_TYPE_GAIN_MAP: u32 = 0x05_0000;
 
 /// The most data one segment holds: its length field counts itself, and is 16 bits.
 const MAX_SEGMENT_DATA: usize = 65_535 - 2;
@@ -55,6 +66,76 @@ fn segments(bytes: &[u8]) -> impl Iterator<Item = (u8, &[u8], usize)> {
             return Some((marker, data, start));
         }
     })
+}
+
+/// Whether the JPEG in `bytes` declares a gain map in the segments ahead of its first scan: an ISO 21496-1 version
+/// marker, an MPF entry of type Gain Map, or an XMP packet declaring the `hdrgm` namespace. Nothing after the primary
+/// image's first `SOS` is read, so the gain map itself, and a malformed file, cost nothing.
+pub(in crate::image) fn has_gain_map(bytes: &[u8]) -> bool {
+    segments(bytes).any(|(marker, data, _)| match marker {
+        APP2 => data.starts_with(ISO_GAIN_MAP_HEADER) || mpf_has_gain_map(data),
+        APP1 => data.starts_with(XMP_HEADER) && xmp::contains(&data[XMP_HEADER.len()..], HDRGM_NAMESPACE),
+        _ => false,
+    })
+}
+
+/// Whether the `APP2` segment `data` is an MPF index with an entry of type Gain Map. Every read is bounded by the
+/// segment: the entries are read from the bytes present, never from a count the file claims.
+fn mpf_has_gain_map(data: &[u8]) -> bool {
+    let Some(tiff) = data.strip_prefix(MPF_HEADER) else {
+        return false;
+    };
+    let big = match tiff.get(0..4) {
+        Some(b"MM\0\x2a") => true,
+        Some(b"II\x2a\0") => false,
+        _ => return false,
+    };
+    let u16_at = |at: usize| {
+        let pair: [u8; 2] = tiff.get(at..at.checked_add(2)?)?.try_into().ok()?;
+        Some(if big {
+            u16::from_be_bytes(pair)
+        } else {
+            u16::from_le_bytes(pair)
+        })
+    };
+    let u32_at = |at: usize| {
+        let quad: [u8; 4] = tiff.get(at..at.checked_add(4)?)?.try_into().ok()?;
+        Some(if big {
+            u32::from_be_bytes(quad)
+        } else {
+            u32::from_le_bytes(quad)
+        })
+    };
+
+    let found = (|| {
+        let ifd = usize::try_from(u32_at(4)?).ok()?;
+        let count = usize::from(u16_at(ifd)?);
+        let entry = (0..count)
+            .map_while(|i| ifd.checked_add(2)?.checked_add(i.checked_mul(12)?))
+            .take_while(|&at| at.checked_add(12).is_some_and(|end| end <= tiff.len()))
+            .find(|&at| u16_at(at) == Some(MP_ENTRY))?;
+        let length = usize::try_from(u32_at(entry + 4)?).ok()?;
+        let offset = usize::try_from(u32_at(entry + 8)?).ok()?;
+        let table = tiff.get(offset..offset.checked_add(length)?)?;
+        Some(
+            table
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .any(|image| attribute(image, big) & 0x00FF_FFFF == MP_TYPE_GAIN_MAP),
+        )
+    })();
+    found.unwrap_or(false)
+}
+
+/// The first four bytes of `image`, an MP Entry, as its attribute in the index's byte order.
+fn attribute(image: &[u8; 16], big: bool) -> u32 {
+    let quad = [image[0], image[1], image[2], image[3]];
+    if big {
+        u32::from_be_bytes(quad)
+    } else {
+        u32::from_le_bytes(quad)
+    }
 }
 
 /// Reads a JPEG's EXIF, XMP and IPTC.

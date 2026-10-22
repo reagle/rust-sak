@@ -130,6 +130,25 @@ fn isobmff(bytes: &[u8]) -> Result<Option<Declared<'_>>, Truncated> {
     Ok(primary_colr(meta).and_then(|colrs| profile_from_colrs(&colrs)))
 }
 
+/// The transfer characteristics of the `nclx` colour description the primary item of the AVIF or HEIF in `bytes`
+/// carries, whether or not it also carries an ICC profile (which [`declared`] prefers); `None` when it carries none,
+/// when the format is not one of the two, or when the file cannot be walked that far.
+pub(super) fn coded_transfer(bytes: &[u8], format: ImageFormat) -> Option<u16> {
+    if !matches!(format, ImageFormat::Avif | ImageFormat::Heif) {
+        return None;
+    }
+    let mut rest = bytes;
+    let meta = loop {
+        match next_box(rest).ok()?? {
+            (kind, body, _) if &kind == b"meta" => break body,
+            (_, _, next) => rest = next,
+        }
+    };
+    let colrs = primary_colr(meta)?;
+    let nclx = colrs.iter().find(|body| body.get(0..4) == Some(b"nclx"))?;
+    read_u16(nclx, 6)
+}
+
 /// The bodies of the `colr` properties associated with the primary item, from the body of the `meta` box.
 fn primary_colr(meta: &[u8]) -> Option<Vec<&[u8]>> {
     // `meta` is a full box: a version byte and three bytes of flags before its children.
