@@ -15,10 +15,11 @@ use super::{ImageFormat, Metadata, icc_profile_bytes};
 /// A JPEG also gives its gain-map container, for an Ultra HDR / ISO 21496-1 file:
 /// [`iso_gain_map`](Metadata::iso_gain_map), the payload of its `APP2` `urn:iso:std:iso:ts:21496:-1` segment, and
 /// [`gain_map`](Metadata::gain_map), the gain-map image its MPF index locates — the entry of type Gain Map, or the
-/// first secondary entry when the primary declares a gain map (an ISO marker or `hdrgm` XMP) — by that entry's offset
-/// and size, never the primary's recorded size. The image must lie in the file after the index, start with `SOI` and
-/// hold an `EOI` (it is cut there), and be at most 64 MiB; otherwise it is `None`. Every other format gives `None` for
-/// both.
+/// first secondary entry if it has type 0 and the primary declares a gain map (an ISO marker or `hdrgm` XMP) — by that
+/// entry's offset and size, never the primary's recorded size. The image must lie in the file after the index, start
+/// with `SOI` and hold an `EOI` (it is cut there), and be at most 64 MiB. Where the offset is stale, the first secondary
+/// image is taken from straight after the primary's `EOI` to its own. Otherwise it is `None`. Every other format gives
+/// `None` for both.
 ///
 /// **Infallible**: metadata is never a reason to refuse a photograph. An unrecognised format gives
 /// [`Metadata::default()`]; a block that is truncated, overruns its container, fails its checksum, or is not what its
