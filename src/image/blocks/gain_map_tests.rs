@@ -219,33 +219,61 @@ fn with_entry(file: &[u8], size: u32, offset: u32) -> Vec<u8> {
 }
 
 #[test]
-fn a_gain_map_that_is_not_where_the_index_says_is_left_out_and_the_rest_kept() {
+fn a_stale_or_hostile_offset_falls_back_to_the_image_straight_after_the_primary() {
     let (file, gain_map) = ultra_hdr(HAWK);
     let tiff_at = u32::try_from(find(&file, b"MPF\0") + 4).unwrap();
     let start = u32::try_from(file.len() - gain_map.len()).unwrap() - tiff_at;
     let size = u32::try_from(gain_map.len()).unwrap();
 
-    for (why, hostile) in [
+    for (why, stale) in [
         ("past the end", with_entry(&file, size, start + 1)),
         ("size past the end", with_entry(&file, size + 1, start)),
         ("far past the end", with_entry(&file, u32::MAX, u32::MAX)),
         ("offset zero, the primary", with_entry(&file, size, 0)),
         ("inside the index", with_entry(&file, size, 4)),
-        ("not at an SOI", with_entry(&file, size - 1, start + 1)),
-        ("truncated, no EOI", file[..file.len() - 2].to_vec()),
-        ("truncated mid-image", file[..file.len() - gain_map.len() / 2].to_vec()),
+        ("not at an SOI", with_entry(&file, size - 1, start - 1)),
     ] {
-        let read = metadata_bytes(&hostile);
-        assert_eq!(read.gain_map, None, "{why}");
-        assert_eq!(read.iso_gain_map.as_deref(), Some(VERSION), "{why}");
-        assert_eq!(read.xmp.as_deref(), Some(PRIMARY_XMP), "{why}");
+        assert_eq!(metadata_bytes(&stale).gain_map.as_deref(), Some(&gain_map[..]), "{why}");
     }
+
+    // As ExifTool leaves a file it added a comment to: a `COM` after the index, the gain map's offset not updated.
+    let index_end = find(&file, b"MPF\0") + 86;
+    let comment = [&[0xFF, 0xFE, 0x00, 0x0B][..], b"fresh run"].concat();
+    let commented = [&file[..index_end], &comment, &file[index_end..]].concat();
+    assert_eq!(metadata_bytes(&commented).gain_map, Some(gain_map.clone()));
 
     // Padding after the gain map's `EOI` that the size covers is cut off.
     let mut padded = file.clone();
     padded.extend([0; 7]);
     let padded = with_entry(&padded, size + 7, start);
     assert_eq!(metadata_bytes(&padded).gain_map, Some(gain_map));
+}
+
+#[test]
+fn a_gain_map_that_cannot_be_found_either_way_is_left_out_and_the_rest_kept() {
+    let (file, gain_map) = ultra_hdr(HAWK);
+    let at_gain_map = file.len() - gain_map.len();
+    let mut no_soi = file.clone();
+    no_soi[at_gain_map + 1] = 0x00;
+    // A second secondary entry with a stale offset: what follows the primary is the first one's, not it.
+    let (second, _) = assemble(HAWK, &[(0x04_0000, false), (0x05_0000, true)]);
+    let tiff_at = find(&second, b"MPF\0") + 4;
+    let mut second_stale = second.clone();
+    let entry = tiff_at + 50 + 32;
+    let offset = u32::from_be_bytes(second_stale[entry + 8..entry + 12].try_into().unwrap());
+    second_stale[entry + 8..entry + 12].copy_from_slice(&(offset + 1).to_be_bytes());
+
+    for (why, hostile) in [
+        ("truncated, no EOI", file[..file.len() - 2].to_vec()),
+        ("truncated mid-image", file[..file.len() - gain_map.len() / 2].to_vec()),
+        ("no SOI after the primary", no_soi),
+        ("the second secondary, stale", second_stale),
+    ] {
+        let read = metadata_bytes(&hostile);
+        assert_eq!(read.gain_map, None, "{why}");
+        assert_eq!(read.iso_gain_map.as_deref(), Some(VERSION), "{why}");
+        assert_eq!(read.xmp.as_deref(), Some(PRIMARY_XMP), "{why}");
+    }
 }
 
 #[test]
@@ -263,16 +291,26 @@ fn a_gain_map_without_an_index_or_a_file_without_soi_gives_none() {
 
 #[test]
 fn truncations_and_byte_flips_of_a_gain_map_jpeg_never_panic() {
-    let (file, _) = ultra_hdr(Shape { big: false, ..HAWK });
-    for len in 0..file.len() {
-        let _ = metadata_bytes(&file[..len]);
-    }
-    let mut bytes = file.clone();
-    for at in 0..bytes.len() {
-        for value in [bytes[at] ^ 0xFF, 0x00, 0xFF, bytes[at] ^ 0x01] {
-            let original = std::mem::replace(&mut bytes[at], value);
-            let _ = metadata_bytes(&bytes);
-            bytes[at] = original;
+    let (file, gain_map) = ultra_hdr(Shape { big: false, ..HAWK });
+    // And one whose offset is stale, so every mutation also goes through the walk to the primary's `EOI`.
+    let tiff_at = find(&file, b"MPF\0") + 4;
+    let entry = tiff_at + 50 + 16;
+    let mut stale = file.clone();
+    let offset = u32::try_from(file.len() - gain_map.len() - tiff_at - 1).unwrap();
+    stale[entry + 8..entry + 12].copy_from_slice(&offset.to_le_bytes());
+    assert_eq!(metadata_bytes(&stale).gain_map, Some(gain_map));
+
+    for file in [file, stale] {
+        for len in 0..file.len() {
+            let _ = metadata_bytes(&file[..len]);
+        }
+        let mut bytes = file.clone();
+        for at in 0..bytes.len() {
+            for value in [bytes[at] ^ 0xFF, 0x00, 0xFF, bytes[at] ^ 0x01] {
+                let original = std::mem::replace(&mut bytes[at], value);
+                let _ = metadata_bytes(&bytes);
+                bytes[at] = original;
+            }
         }
     }
 }

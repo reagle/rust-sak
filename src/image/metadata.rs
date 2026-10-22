@@ -40,8 +40,9 @@ pub struct Metadata {
     /// binary gain-map metadata. Embedded in JPEG only, as one `APP2` (at most 65,505 bytes).
     pub iso_gain_map: Option<Vec<u8>>,
     /// A JPEG's gain-map image: a complete JPEG from `SOI` to `EOI`, byte for byte, its own XMP and ISO 21496-1
-    /// metadata inside it. Read from the primary's MPF index (the entry of type Gain Map, or the first secondary entry
-    /// when the primary declares a gain map); embedded in JPEG only, appended after the primary's `EOI` and located by
+    /// metadata inside it. Read from the primary's MPF index (the entry of type Gain Map, or a first secondary entry of
+    /// type 0 when the primary declares a gain map), or straight after the primary's `EOI` where the index's offset is
+    /// stale; embedded in JPEG only, appended after the primary's `EOI` and located by
     /// an MPF `APP2` index this crate writes (at most 64 MiB). See the module README's *Gain maps* section.
     pub gain_map: Option<Vec<u8>>,
 }
