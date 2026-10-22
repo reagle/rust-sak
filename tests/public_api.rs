@@ -105,7 +105,8 @@ mod github {
 #[cfg(feature = "image")]
 mod image {
     use rust_sak::image::{
-        EncodeOptions, ImageError, ImageFormat, decode_bytes, encode_writer, format_from_bytes, probe_bytes, rotate,
+        EncodeOptions, Hdr, ImageError, ImageFormat, decode_bytes, encode_writer, format_from_bytes, hdr_bytes,
+        probe_bytes, rotate,
     };
 
     #[test]
@@ -128,6 +129,21 @@ mod image {
         )
         .unwrap_err();
         assert!(matches!(err, ImageError::FormatMismatch { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn hdr_detection_is_reachable_from_outside_the_crate() {
+        let mut bytes = Vec::new();
+        encode_writer(
+            &image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4)),
+            &mut bytes,
+            ImageFormat::Png,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(hdr_bytes(&bytes), None);
+        assert_eq!(Hdr::GainMap.name(), "gain map");
     }
 
     #[test]
