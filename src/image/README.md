@@ -22,7 +22,7 @@ image = { version = "0.25", default-features = false }
 ```rust
 use rust_sak::image::{
     decode_file, decode_bytes, decode_bytes_with_format, format_from_bytes,
-    probe_file, probe_bytes, icc_profile_bytes, icc_profile_file, icc_profile_description,
+    probe_file, probe_bytes, icc_profile_bytes, icc_profile_file, icc_profile_description, hdr_bytes, Hdr,
     encode_file, encode_writer, encode_file_with, encode_writer_with,
     ImageFormat, ImageInfo, EncodeOptions, Metadata, Embedded, PngCompression, PngFilter, Preset, Chroma,
     ImageError, Result,
@@ -56,6 +56,7 @@ are pure pixel arithmetic with nothing to fail, so they return their picture dir
 | `icc_profile_file`  | `fn icc_profile_file(path: impl AsRef<Path>) -> Result<Option<Vec<u8>>>` | Same, for a file; format from the **extension**. Reads only the header for native formats, a 64 KiB prefix (or the whole file, if the profile lies further in) for the containers. |
 | `exif_field`        | `fn exif_field(exif: &[u8], ifd: ExifIfd, tag: u16) -> Option<ExifValue>` | One `ASCII`, `SHORT` or `LONG` field of an EXIF block. See [Editing EXIF](#editing-exif). |
 | `metadata_bytes`    | `fn metadata_bytes(bytes: &[u8]) -> Metadata` | Everything `Metadata` carries — ICC profile, EXIF, XMP, IPTC — **byte for byte**; format from **magic bytes**. Infallible. See [Metadata blocks](#metadata-blocks). |
+| `hdr_bytes`         | `fn hdr_bytes(bytes: &[u8]) -> Option<Hdr>` | Whether the file **declares HDR** — a JPEG gain map, or a PQ/HLG transfer — from its headers; format from **magic bytes**. Infallible. See [HDR detection](#hdr-detection). |
 
 ### Transforming
 
@@ -145,6 +146,29 @@ let embedded = encode_writer_with(
     &DynamicImage::ImageRgb8(RgbImage::new(4, 4)), &mut out, ImageFormat::Png, None, &metadata,
 ).unwrap();
 assert!(!embedded.icc_profile);
+```
+
+### HDR detection
+
+`hdr_bytes` answers whether a file holds more than an SDR rendition, so a converter can tell its user that writing it as an ordinary 8-bit file loses that. It reads headers only, never pixels, and answers an `Hdr` (`#[non_exhaustive]`):
+
+| Found | `Hdr` |
+|---|---|
+| JPEG, in the segments before the first scan: an `APP2` ISO 21496-1 version marker (`urn:iso:std:iso:ts:21496:-1`), an `APP2` MPF index with an entry of type Gain Map (CIPA DC-007 `0x050000`), or `APP1` XMP declaring the `http://ns.adobe.com/hdr-gain-map/1.0/` (`hdrgm`) namespace | `GainMap` |
+| PNG `cICP`, or the AVIF/HEIF primary item's `nclx` `colr`, with transfer characteristics 16 / 18 | `Pq` / `Hlg` |
+| An embedded ICC profile (any format) with a v4.4 `cicp` tag whose transfer is 16 / 18 | `Pq` / `Hlg` |
+
+- A gain map wins over a transfer, since its base image is SDR. `Hdr::name` gives `gain map`, `PQ` or `HLG`.
+- **Not detected:** AVIF/HEIF gain maps (`tmap` items) and Apple's earlier private gain maps (an MPF secondary image with no Gain Map type, ISO marker or `hdrgm` namespace).
+- **Untrusted input is bounded** like the rest of the module: only a JPEG's segments ahead of `SOS` are walked, an MPF's entries are read from the bytes present (never a claimed count), a PNG `cICP` with a bad CRC is ignored, and anything malformed reads as `None`.
+
+```rust
+use image::{DynamicImage, RgbImage};
+use rust_sak::image::{ImageFormat, encode_writer, hdr_bytes};
+
+let mut jpeg = Vec::new();
+encode_writer(&DynamicImage::ImageRgb8(RgbImage::new(4, 4)), &mut jpeg, ImageFormat::Jpeg, None).unwrap();
+assert_eq!(hdr_bytes(&jpeg), None); // an ordinary SDR JPEG
 ```
 
 ### Metadata blocks

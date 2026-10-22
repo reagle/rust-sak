@@ -34,6 +34,14 @@ fn chunks(bytes: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8], usize, u32)> {
     })
 }
 
+/// The transfer characteristics code of a PNG's `cICP` chunk (PNG Third Edition), if it has one with a valid CRC.
+pub(in crate::image) fn cicp_transfer(bytes: &[u8]) -> Option<u8> {
+    chunks(bytes)
+        .find(|(kind, ..)| kind == b"cICP")
+        .filter(|(kind, data, _, crc)| data.len() == 4 && crc32(kind, data) == *crc)
+        .map(|(_, data, ..)| data[1])
+}
+
 fn crc32(kind: &[u8; 4], data: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(kind);

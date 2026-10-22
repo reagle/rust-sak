@@ -21,6 +21,8 @@
 //! - [`encode_writer`] — encode and write to any [`Write`](std::io::Write) sink with an explicit [`ImageFormat`].
 //! - [`exif_field`], [`patch_exif`] and [`rebuild_exif`] — read one EXIF field, and change fields without moving the
 //!   bytes that are kept (so a MakerNote stays valid), or rebuild compactly without the MakerNote.
+//! - [`hdr_bytes`] — whether a file declares HDR ([`Hdr`]: a JPEG gain map, or a PQ/HLG transfer), without decoding
+//!   the pixels.
 //! - [`metadata_bytes`] — read everything a [`Metadata`] carries (ICC profile, EXIF, XMP, IPTC) without decoding the
 //!   pixels.
 //! - [`encode_file_with`] / [`encode_writer_with`] — the same, embedding the [`Metadata`] given (an ICC profile, EXIF,
@@ -90,6 +92,7 @@ mod exif;
 mod fit;
 mod format;
 mod format_from_bytes;
+mod hdr;
 mod icc;
 mod icc_profile_bytes;
 mod icc_profile_description;
@@ -119,6 +122,7 @@ pub use exif::{
 pub use fit::fit;
 pub use format::ImageFormat;
 pub use format_from_bytes::format_from_bytes;
+pub use hdr::{Hdr, hdr_bytes};
 pub use icc_profile_bytes::icc_profile_bytes;
 pub use icc_profile_description::icc_profile_description;
 pub use icc_profile_file::icc_profile_file;

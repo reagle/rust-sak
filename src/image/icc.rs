@@ -42,6 +42,29 @@ pub(super) fn description(profile: &[u8]) -> Option<String> {
     (!text.is_empty()).then(|| text.chars().take(MAX_CHARS).collect::<String>().trim_end().to_owned())
 }
 
+/// The transfer characteristics code (ITU-T H.273) of the ICC `profile`'s `cicp` tag (ICC.1:2022, v4.4), or `None`
+/// when it has none or is not a well-formed profile. The tag body is its signature, four reserved bytes, then the
+/// colour primaries, transfer characteristics, matrix coefficients and full-range flag, one byte each.
+pub(super) fn cicp_transfer(profile: &[u8]) -> Option<u8> {
+    if profile.get(36..40)? != b"acsp" {
+        return None;
+    }
+    let count = read_u32(profile, HEADER_LEN)? as usize;
+    let tag = (0..count)
+        .map_while(|i| {
+            let entry = HEADER_LEN + 4 + i * 12;
+            profile.get(entry..entry + 12)
+        })
+        .find(|entry| &entry[0..4] == b"cicp")?;
+    let offset = read_u32(tag, 4)? as usize;
+    let size = read_u32(tag, 8)? as usize;
+    let data = profile.get(offset..offset.checked_add(size)?)?;
+    if data.get(0..4)? != b"cicp" {
+        return None;
+    }
+    data.get(9).copied()
+}
+
 /// ICC v2 `textDescriptionType`: the signature, 4 reserved bytes, an ASCII count (which includes the terminating
 /// NUL), then the ASCII text. The Unicode and ScriptCode variants that follow it repeat the same text and are skipped.
 fn text_description(data: &[u8]) -> Option<String> {
