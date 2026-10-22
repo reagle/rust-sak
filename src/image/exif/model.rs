@@ -21,8 +21,10 @@ pub(super) const INTEROP_POINTER: u16 = 0xA005;
 /// The tag of the maker's private block in the Exif IFD.
 pub(super) const MAKER_NOTE: u16 = 0x927C;
 /// IFD1's thumbnail: the offset of the JPEG data and its length.
-const THUMBNAIL_OFFSET: u16 = 0x0201;
-const THUMBNAIL_LENGTH: u16 = 0x0202;
+pub(super) const THUMBNAIL_OFFSET: u16 = 0x0201;
+pub(super) const THUMBNAIL_LENGTH: u16 = 0x0202;
+/// An uncompressed thumbnail's strips, whose data this does not locate.
+pub(super) const STRIP_OFFSETS: u16 = 0x0111;
 
 /// The block's byte order, from its `II`/`MM` mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,13 +91,16 @@ impl Entry {
         type_size(self.kind)?.checked_mul(usize::try_from(self.count).ok()?)
     }
 
-    /// Where an out-of-line value lies in `block`, or `None` when the value is inline, of unknown size, or overruns.
+    /// Where an out-of-line value lies in `block`, or `None` when the value is inline, of unknown size, overruns, or
+    /// claims to start inside the 8-byte TIFF header (which no value can share).
     pub(super) fn range(&self, order: Order, block: &[u8]) -> Option<Range<usize>> {
         let size = self.size()?;
         if size <= 4 {
             return None;
         }
-        let start = usize::try_from(order.u32(&self.raw, 0)?).ok()?;
+        let start = usize::try_from(order.u32(&self.raw, 0)?)
+            .ok()
+            .filter(|&start| start >= 8)?;
         let end = start.checked_add(size)?;
         (end <= block.len()).then_some(start..end)
     }
@@ -225,7 +230,9 @@ impl Model {
                 _ => None,
             }
         };
-        let start = usize::try_from(single(THUMBNAIL_OFFSET)?).ok()?;
+        let start = usize::try_from(single(THUMBNAIL_OFFSET)?)
+            .ok()
+            .filter(|&start| start >= 8)?;
         let end = start.checked_add(usize::try_from(single(THUMBNAIL_LENGTH)?).ok()?)?;
         (end <= block.len()).then_some(start..end)
     }

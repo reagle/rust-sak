@@ -103,6 +103,11 @@ pub enum ExifError {
     /// may change.
     #[error("tag {0:#06x} is an IFD pointer and cannot be edited")]
     PointerTag(u16),
+    /// [`ExifEdit::DropThumbnail`] was asked for, but the thumbnail cannot be located exactly enough to be removed
+    /// without leaving its bytes behind: IFD1 does not parse, its JPEG tags point outside the block, it is stored as
+    /// strips, or something still in use shares its bytes. [`rebuild_exif`] never carries a thumbnail.
+    #[error("the thumbnail cannot be removed in place")]
+    ThumbnailUnremovable,
 }
 
 /// What [`rebuild_exif`] produced.
@@ -149,9 +154,14 @@ pub fn exif_field(exif: &[u8], ifd: ExifIfd, tag: u16) -> Option<ExifValue> {
 /// - [`ExifEdit::DropThumbnail`] sets IFD0's next-IFD offset to 0 and frees IFD1 and the thumbnail.
 ///
 /// Every byte freed is zeroed — unless another entry's value overlaps it, in which case it is left alone. Freed bytes
-/// that reach the end of the block are cut off before anything is appended, and the rest are reused before the block
-/// grows. So a MakerNote, which is an out-of-line value like any other, keeps both its bytes and its offset, and its
-/// absolute internal pointers stay valid; so does anything else in the block that nothing here touches.
+/// that reach the end of the block are cut off before anything is appended; freed bytes elsewhere are never reused, and
+/// nothing is ever written past the last byte it freed or the end of the block, so a structure the parser does not
+/// model (a SubIFD, a MakerNote's own directories) is never overwritten. A MakerNote, an out-of-line value like any
+/// other, keeps both its bytes and its offset, and its absolute internal pointers stay valid.
+///
+/// A dropped thumbnail is always zeroed, even when an entry of unknown type turns off every other zeroing: data that
+/// is dropped must not survive in the block. If it cannot be located exactly, the patch fails with
+/// [`ExifError::ThumbnailUnremovable`] rather than leave it behind.
 ///
 /// The one residual risk is one every EXIF editor shares: a MakerNote whose internal pointers reach outside its own
 /// declared extent, into bytes this frees. They are freed only when no parsed entry points into them.
@@ -159,7 +169,7 @@ pub fn exif_field(exif: &[u8], ifd: ExifIfd, tag: u16) -> Option<ExifValue> {
 /// # Errors
 ///
 /// [`ExifError::Malformed`] if the header or IFD0 does not parse, [`ExifError::PointerTag`] if an edit names an IFD
-/// pointer. A missing sub-IFD is not an error: edits to it are skipped.
+/// pointer, [`ExifError::ThumbnailUnremovable`] as above. A missing sub-IFD is not an error: edits to it are skipped.
 ///
 /// ```
 /// use rust_sak::image::{ExifEdit, ExifIfd, ExifValue, exif_field, patch_exif};
@@ -186,7 +196,8 @@ pub fn patch_exif(exif: &[u8], edits: &[ExifEdit]) -> Result<Vec<u8>, ExifError>
 ///
 /// # Errors
 ///
-/// As [`patch_exif`].
+/// [`ExifError::Malformed`] and [`ExifError::PointerTag`] as for [`patch_exif`]; never
+/// [`ExifError::ThumbnailUnremovable`], since no thumbnail is carried.
 pub fn rebuild_exif(exif: &[u8], edits: &[ExifEdit]) -> Result<Rebuilt, ExifError> {
     reject_pointer_edits(edits)?;
     Ok(rebuild::rebuild(exif, &Model::parse(exif)?, edits))
