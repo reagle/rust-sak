@@ -2,9 +2,8 @@ use std::io::Write;
 
 use ::image::DynamicImage;
 
-use super::dispatch::{encode_into, resolve_options};
 use super::error::Result;
-use super::{EncodeOptions, ImageFormat};
+use super::{EncodeOptions, ImageFormat, Metadata, encode_writer_with};
 
 /// Encodes `image` in the given `format` and writes the bytes to `writer`.
 ///
@@ -20,12 +19,13 @@ use super::{EncodeOptions, ImageFormat};
 /// Most formats are streamed straight into `writer`. BMP, GIF and TIFF are the exception — their encoder needs
 /// [`Seek`](std::io::Seek), which a bare [`Write`] cannot provide, so those three are buffered whole before being
 /// written. Pass a [`File`](std::fs::File) via [`encode_file`](super::encode_file) to stream them too.
+///
+/// Embeds nothing beside the pixels; [`encode_writer_with`] is the same encode with a [`Metadata`] to embed.
 pub fn encode_writer(
     image: &DynamicImage,
     writer: &mut impl Write,
     format: ImageFormat,
     options: Option<EncodeOptions>,
 ) -> Result<()> {
-    let options = resolve_options(format, options)?;
-    encode_into(image, options, writer)
+    encode_writer_with(image, writer, format, options, &Metadata::default()).map(drop)
 }
