@@ -395,11 +395,11 @@ fn the_thumbnail_is_detached_zeroed_and_trimmed_and_its_space_reused() {
 }
 
 #[test]
-fn freed_space_in_the_middle_is_reused_before_the_block_grows() {
+fn freed_space_in_the_middle_is_zeroed_and_never_reused() {
     for order in ORDERS {
         let sample = sample(order);
         // Software outgrows its slot and Copyright is added, so IFD0's table moves too: the old table and the old
-        // Software value are freed, and both new values land in that freed space rather than past the end.
+        // Software value are zeroed, and everything new goes past the end of the block, never into them.
         let edits = [
             ExifEdit::Set {
                 ifd: ExifIfd::Primary,
@@ -416,15 +416,17 @@ fn freed_space_in_the_middle_is_reused_before_the_block_grows() {
         let model = Model::parse(&patched).unwrap();
         for tag in [SOFTWARE, 0x8298] {
             let range = model.primary.find(tag).unwrap().range(order, &patched).unwrap();
-            assert!(range.end <= 110, "{tag:#x} at {range:?} ({order:?})");
+            assert!(range.start >= sample.exif.len(), "{tag:#x} at {range:?} ({order:?})");
         }
+        assert!(model.primary.at >= sample.exif.len());
+        assert_eq!(&patched[134..148], &[0; 14], "the old value was left behind");
+        assert!(
+            patched[8..110].iter().all(|&byte| byte == 0),
+            "the old table was left behind"
+        );
         assert_eq!(
             exif_field(&patched, ExifIfd::Primary, 0x8298),
             Some(ascii("(c) Example"))
-        );
-        assert_eq!(
-            exif_field(&patched, ExifIfd::Primary, SOFTWARE),
-            Some(ascii("a much longer software name"))
         );
         assert_maker_note_kept(&sample, &patched, order);
     }
@@ -537,22 +539,107 @@ fn two_edited_entries_sharing_a_value_do_not_share_their_new_space() {
 }
 
 #[test]
-fn an_entry_of_an_unknown_type_turns_off_zeroing_and_trimming() {
+fn an_entry_of_an_unknown_type_keeps_old_values_but_never_the_thumbnail() {
     let mut exif = sample(Order::Little).exif;
     // Give the Interop entry type 99, whose size nothing knows.
     exif[300 + 2 + 2..300 + 2 + 4].copy_from_slice(&99_u16.to_le_bytes());
-    let patched = patch_exif(&exif, &[ExifEdit::DropThumbnail]).unwrap();
-    assert_eq!(
-        patched.len(),
-        exif.len(),
-        "trimmed despite an entry it cannot see the extent of"
-    );
-    assert_eq!(
-        &patched[414..514],
-        &exif[414..514],
-        "zeroed despite an entry it cannot see the extent of"
+    let edits = [
+        ExifEdit::DropThumbnail,
+        ExifEdit::Set {
+            ifd: ExifIfd::Primary,
+            tag: SOFTWARE,
+            value: ascii("a much longer software name"),
+        },
+    ];
+    let patched = patch_exif(&exif, &edits).unwrap();
+    // The old Software value is left as it was: the unknown entry might point into it.
+    assert_eq!(&patched[134..148], &exif[134..148]);
+    // The thumbnail, which was dropped, is gone all the same.
+    assert!(
+        !patched.windows(2).any(|pair| pair == [0xFF, 0xD8]),
+        "the thumbnail survived"
     );
     assert_eq!(Model::parse(&patched).unwrap().primary.next, 0);
+}
+
+// ── The review's cases (fixtures/review-mk.py builds them) ──────────────────────────────────────────────────────
+
+#[test]
+fn a_structure_the_model_does_not_see_is_never_trimmed_or_written_over() {
+    // IFD0 has a SubIFDs entry (0x014A) pointing at an IFD that ends the block with a zero next-IFD offset.
+    let exif = include_bytes!("fixtures/a-subifd.exif");
+    let edits = [ExifEdit::Set {
+        ifd: ExifIfd::Primary,
+        tag: SOFTWARE,
+        value: ascii("Open Photo AI 26.10.0"),
+    }];
+    let patched = patch_exif(exif, &edits).unwrap();
+    // IFD0 gains an entry and moves; every byte of the SubIFD, its trailing zeros included, is where it was.
+    assert_eq!(&patched[38..exif.len()], &exif[38..]);
+    assert!(patched.len() > exif.len());
+    assert_eq!(
+        exif_field(&patched, ExifIfd::Primary, SOFTWARE),
+        Some(ascii("Open Photo AI 26.10.0"))
+    );
+}
+
+#[test]
+fn a_dropped_thumbnail_does_not_survive_an_unknown_entry_type() {
+    let exif = include_bytes!("fixtures/b-cautious-thumb.exif");
+    let patched = patch_exif(exif, &[ExifEdit::DropThumbnail]).unwrap();
+    assert!(!patched.windows(6).any(|window| window == b"SECRET"), "{patched:?}");
+}
+
+#[test]
+fn a_thumbnail_that_cannot_be_located_is_refused_rather_than_left_behind() {
+    let mut exif = include_bytes!("fixtures/b-cautious-thumb.exif").to_vec();
+    // Its JPEG offset now points past the end of the block.
+    let entry = 38 + 2 + 8;
+    exif[entry..entry + 4].copy_from_slice(&9_999_u32.to_le_bytes());
+    assert_eq!(
+        patch_exif(&exif, &[ExifEdit::DropThumbnail]),
+        Err(ExifError::ThumbnailUnremovable)
+    );
+    // An IFD1 that does not parse at all.
+    let mut broken = sample(Order::Little).exif;
+    broken[8 + 2 + 12 * 8..8 + 2 + 12 * 8 + 4].copy_from_slice(&510_u32.to_le_bytes());
+    assert_eq!(
+        patch_exif(&broken, &[ExifEdit::DropThumbnail]),
+        Err(ExifError::ThumbnailUnremovable)
+    );
+    // The rebuild never carries a thumbnail, so it is the way out.
+    let rebuilt = rebuild_exif(&exif, &[ExifEdit::DropThumbnail]).unwrap().exif;
+    assert!(!rebuilt.windows(6).any(|window| window == b"SECRET"));
+}
+
+#[test]
+fn a_value_claiming_the_header_is_never_written_over_it() {
+    // Software's 40-byte value claims offset 0, inside the TIFF header.
+    let exif = include_bytes!("fixtures/c-header-overlap.exif");
+    let edits = [ExifEdit::Set {
+        ifd: ExifIfd::Primary,
+        tag: SOFTWARE,
+        value: ascii("Open Photo AI"),
+    }];
+    let patched = patch_exif(exif, &edits).unwrap();
+    assert_eq!(&patched[..8], &exif[..8]);
+    assert_eq!(
+        exif_field(&patched, ExifIfd::Primary, SOFTWARE),
+        Some(ascii("Open Photo AI"))
+    );
+    assert_eq!(exif_field(&patched, ExifIfd::Primary, 0x010F), Some(ascii("Cam")));
+    // Read as a value, it is no value at all.
+    assert_eq!(exif_field(exif, ExifIfd::Primary, SOFTWARE), None);
+}
+
+#[test]
+fn the_reviews_loop_case_neither_loops_nor_panics() {
+    let exif = include_bytes!("fixtures/d-loop.exif");
+    let edits = every_edit();
+    if let Ok(patched) = patch_exif(exif, &edits) {
+        assert!(Model::parse(&patched).is_ok());
+    }
+    let _ = rebuild_exif(exif, &edits);
 }
 
 #[test]
@@ -708,7 +795,12 @@ fn every_edit() -> Vec<ExifEdit> {
 fn exercise(block: &[u8]) {
     let edits = every_edit();
     let _ = exif_field(block, ExifIfd::Exif, PIXEL_X);
-    if let Ok(patched) = patch_exif(block, &edits) {
+    let patched = patch_exif(block, &edits);
+    // A thumbnail that cannot be removed in place is never left behind: the caller rebuilds.
+    if patched == Err(ExifError::ThumbnailUnremovable) {
+        assert!(rebuild_exif(block, &edits).is_ok());
+    }
+    if let Ok(patched) = patched {
         // What a patch produces must itself parse, and say what it was told to.
         assert!(Model::parse(&patched).is_ok());
         assert_eq!(

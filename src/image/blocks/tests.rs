@@ -147,6 +147,21 @@ fn extended_xmp_is_joined_into_one_packet() {
 }
 
 #[test]
+fn an_extended_parts_outer_namespace_declarations_come_along() {
+    // The review's x-extns repro: the extended packet declares `dc` only on its `x:xmpmeta`.
+    let packet = metadata_bytes(include_bytes!("fixtures/review-x-extns.jpg"))
+        .xmp
+        .expect("XMP");
+    let packet = String::from_utf8(packet).unwrap();
+    assert!(packet.contains("dc:"), "{packet}");
+    assert!(
+        packet.contains("xmlns:dc="),
+        "the dc prefix is used but not declared: {packet}"
+    );
+    assert!(!packet.contains("HasExtendedXMP"));
+}
+
+#[test]
 fn an_extended_part_with_a_chunk_missing_leaves_the_standard_packet() {
     // Drop the second extended chunk: the packet cannot be reassembled, and the standard part is all that is kept.
     let mut segments = Vec::new();

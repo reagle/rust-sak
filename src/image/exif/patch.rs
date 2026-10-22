@@ -14,7 +14,7 @@
 
 use std::ops::Range;
 
-use super::model::{Entry, Ifd, Model, Order, overlaps, table_len};
+use super::model::{Entry, Ifd, Model, Order, STRIP_OFFSETS, THUMBNAIL_LENGTH, THUMBNAIL_OFFSET, overlaps, table_len};
 use super::{ExifEdit, ExifError, ExifIfd, ExifValue};
 
 /// The IFDs in the order their tables are written: every child before its parent.
@@ -49,6 +49,8 @@ pub(super) fn patch(block: &[u8], mut model: Model, edits: &[ExifEdit]) -> Resul
     let cautious = all_ifds(&original).any(|ifd| ifd.entries.iter().any(|entry| entry.size().is_none()));
 
     let mut released: Vec<Range<usize>> = Vec::new();
+    // What a dropped thumbnail occupied: zeroed whatever else is uncertain, since it must not survive the drop.
+    let mut thumbnail_bytes: Vec<Range<usize>> = Vec::new();
     let mut dirty = [false; 4];
     let mut grown = [false; 4];
     // Per IFD, per tag: the placement decided for an edited entry.
@@ -56,10 +58,24 @@ pub(super) fn patch(block: &[u8], mut model: Model, edits: &[ExifEdit]) -> Resul
 
     // ── 1. Decide ──
     if edits.contains(&ExifEdit::DropThumbnail) {
-        if let Some(thumbnail) = model.thumbnail.take() {
-            released.push(thumbnail.table());
-            released.extend(thumbnail.entries.iter().filter_map(|entry| entry.range(order, block)));
-            released.extend(original.thumbnail_data(block));
+        match model.thumbnail.take() {
+            Some(thumbnail) => {
+                // A thumbnail this cannot locate exactly — JPEG tags missing or out of the block, or strips — cannot be
+                // proven gone, so the caller is told rather than handed a block that still holds it.
+                let data = original.thumbnail_data(block);
+                let strips = thumbnail.find(STRIP_OFFSETS).is_some();
+                let jpeg_tags =
+                    thumbnail.find(THUMBNAIL_OFFSET).is_some() || thumbnail.find(THUMBNAIL_LENGTH).is_some();
+                if strips || (jpeg_tags && data.is_none()) {
+                    return Err(ExifError::ThumbnailUnremovable);
+                }
+                thumbnail_bytes.push(thumbnail.table());
+                thumbnail_bytes.extend(thumbnail.entries.iter().filter_map(|entry| entry.range(order, block)));
+                thumbnail_bytes.extend(data);
+            }
+            // IFD0 points at an IFD1 that does not parse: whatever it holds cannot be found to be removed.
+            None if model.primary.next != 0 => return Err(ExifError::ThumbnailUnremovable),
+            None => {}
         }
         if model.primary.next != 0 {
             model.primary.next = 0;
@@ -152,6 +168,17 @@ pub(super) fn patch(block: &[u8], mut model: Model, edits: &[ExifEdit]) -> Resul
     }
 
     let mut free: Vec<Range<usize>> = Vec::new();
+    for range in thumbnail_bytes {
+        if range.is_empty() {
+            continue;
+        }
+        // Something still in use shares the thumbnail's bytes: they can be neither kept nor zeroed.
+        if live.iter().any(|kept| overlaps(kept, &range)) {
+            return Err(ExifError::ThumbnailUnremovable);
+        }
+        out[range.clone()].fill(0);
+        free.push(range);
+    }
     if !cautious {
         for range in released {
             if range.is_empty() || live.iter().any(|kept| overlaps(kept, &range)) {
@@ -176,23 +203,20 @@ pub(super) fn patch(block: &[u8], mut model: Model, edits: &[ExifEdit]) -> Resul
         });
 
     // ── 3. Trim ──
-    if !cautious {
-        let live_end = live.iter().map(|range| range.end).max().unwrap_or(8);
-        let mut end = out.len();
-        while end > live_end && out[end - 1] == 0 {
-            end -= 1;
-        }
+    // Only bytes this freed, and only where they reach the end of the block: a structure the model does not see (a
+    // SubIFD, a MakerNote's own directory) may end in zeros that look unused and are not.
+    if let Some(last) = free.last()
+        && last.end == out.len()
+    {
         // Keep the block an even length, as the end of a TIFF stream conventionally is.
-        end = (end + (end & 1)).min(out.len());
+        let end = (last.start + (last.start & 1)).min(out.len());
         out.truncate(end);
-        free = free
-            .into_iter()
-            .filter_map(|range| (range.start < end).then(|| range.start..range.end.min(end)))
-            .collect();
     }
 
     // ── 4. Allocate and write values ──
-    let mut space = Space { free };
+    // Always past the end: freed bytes in the middle are zeroed, never reused, since only what the model sees is
+    // known not to point into them.
+    let mut space = Space;
     for (ifd, tag, placement) in placed {
         let Some(table) = model.ifd_mut(ifd) else { continue };
         let Some(entry) = table.entries.iter_mut().find(|entry| entry.tag == tag) else {
@@ -256,7 +280,9 @@ fn last_edit_per_tag(edits: &[ExifEdit]) -> Vec<(ExifIfd, u16, &ExifValue, bool)
 
 /// Whether `range`, the value of `tag` in `ifd`, is also pointed into by anything else in the original block.
 fn shared(model: &Model, order: Order, block: &[u8], range: &Range<usize>, ifd: ExifIfd, tag: u16) -> bool {
+    // The TIFF header is always in use.
     let mut others: Vec<Range<usize>> = Vec::new();
+    others.push(0..8);
     for which in CHILDREN_FIRST {
         let Some(table) = model.ifd(which) else { continue };
         others.push(table.table());
@@ -329,20 +355,11 @@ fn write_table(out: &mut [u8], order: Order, table: &Ifd) {
     out[at..at + 4].copy_from_slice(&order.u32_bytes(table.next));
 }
 
-/// Space to write into: freed ranges first, then the end of the block, every start on an even offset.
-struct Space {
-    free: Vec<Range<usize>>,
-}
+/// Space to write into: the end of the block, every start on an even offset.
+struct Space;
 
 impl Space {
     fn allocate(&mut self, out: &mut Vec<u8>, len: usize) -> usize {
-        for range in &mut self.free {
-            let start = range.start + (range.start & 1);
-            if start + len <= range.end {
-                range.start = start + len;
-                return start;
-            }
-        }
         if out.len() & 1 == 1 {
             out.push(0);
         }
