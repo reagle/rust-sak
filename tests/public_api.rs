@@ -171,6 +171,36 @@ mod image {
     }
 
     #[test]
+    fn exif_edits_are_built_and_applied_from_outside_the_crate() {
+        use rust_sak::image::{
+            ExifEdit, ExifError, ExifIfd, ExifValue, MAX_JPEG_EXIF_LEN, Rebuilt, exif_field, patch_exif, rebuild_exif,
+        };
+
+        let exif = b"MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0\x06\0\0\0\0\0\0";
+        let edits = [
+            ExifEdit::Replace {
+                ifd: ExifIfd::Primary,
+                tag: 0x0112,
+                value: ExifValue::Short(1),
+            },
+            ExifEdit::Set {
+                ifd: ExifIfd::Exif,
+                tag: 0xA002,
+                value: ExifValue::Long(9),
+            },
+            ExifEdit::DropThumbnail,
+        ];
+        let patched = patch_exif(exif, &edits).unwrap();
+        assert_eq!(
+            exif_field(&patched, ExifIfd::Primary, 0x0112),
+            Some(ExifValue::Short(1))
+        );
+        let rebuilt: Rebuilt = rebuild_exif(exif, &edits).unwrap();
+        assert!(!rebuilt.maker_note_dropped && rebuilt.exif.len() < MAX_JPEG_EXIF_LEN);
+        assert_eq!(patch_exif(b"nope", &edits), Err(ExifError::Malformed));
+    }
+
+    #[test]
     fn rotate_is_reachable_and_expands_the_canvas() {
         let original = image::DynamicImage::ImageRgb8(image::RgbImage::new(240, 120));
         let rotated = rotate(&original, 30.0);

@@ -54,6 +54,7 @@ are pure pixel arithmetic with nothing to fail, so they return their picture dir
 | `icc_profile_bytes` | `fn icc_profile_bytes(bytes: &[u8]) -> Result<Option<Vec<u8>>>` | The **exact bytes** of the embedded ICC colour profile, from the header; format from **magic bytes**. No pixel decode. See [Colour profiles](#colour-profiles). |
 | `icc_profile_description` | `fn icc_profile_description(profile: &[u8]) -> Option<String>` | A profile's own description (`Display P3`), as `ImageInfo::color_profile` reports it. |
 | `icc_profile_file`  | `fn icc_profile_file(path: impl AsRef<Path>) -> Result<Option<Vec<u8>>>` | Same, for a file; format from the **extension**. Reads only the header for native formats, a 64 KiB prefix (or the whole file, if the profile lies further in) for the containers. |
+| `exif_field`        | `fn exif_field(exif: &[u8], ifd: ExifIfd, tag: u16) -> Option<ExifValue>` | One `ASCII`, `SHORT` or `LONG` field of an EXIF block. See [Editing EXIF](#editing-exif). |
 | `metadata_bytes`    | `fn metadata_bytes(bytes: &[u8]) -> Metadata` | Everything `Metadata` carries — ICC profile, EXIF, XMP, IPTC — **byte for byte**; format from **magic bytes**. Infallible. See [Metadata blocks](#metadata-blocks). |
 
 ### Transforming
@@ -182,9 +183,40 @@ assert!(embedded.xmp && !embedded.iptc);
 assert_eq!(metadata_bytes(&png).xmp, metadata.xmp);
 ```
 
+### Editing EXIF
+
+A program that re-encodes a photograph usually has to change a few EXIF fields first: the pixel dimensions after a resize, the software that wrote the file, the thumbnail of a picture that no longer looks like it. **`patch_exif` changes fields without moving any byte that is kept**, which is what keeps a **MakerNote** valid: the camera maker's private block, whose internal pointers are — for Canon, Sony, Pentax, Samsung and others — absolute from the start of the TIFF stream, so that any tool that rebuilds the block from parsed fields silently corrupts it.
+
+| Function | Signature | What it does |
+|---|---|---|
+| `exif_field` | `fn exif_field(exif: &[u8], ifd: ExifIfd, tag: u16) -> Option<ExifValue>` | Reads one field (`ASCII`, a single `SHORT` or `LONG`). `None` for anything else, or a block that does not parse. |
+| `patch_exif` | `fn patch_exif(exif: &[u8], edits: &[ExifEdit]) -> Result<Vec<u8>, ExifError>` | Applies `edits` in place and append-only. |
+| `rebuild_exif` | `fn rebuild_exif(exif: &[u8], edits: &[ExifEdit]) -> Result<Rebuilt, ExifError>` | The fallback: a compact new block with the same edits, **without the MakerNote and the thumbnail**. |
+
+- **`ExifEdit`**: `Set { ifd, tag, value }` (adding the entry if absent, in an IFD that exists — an IFD is never created), `Replace { ifd, tag, value }` (only if present) and `DropThumbnail`. `ExifIfd` is `Primary` (IFD0), `Exif`, `Gps` or `Interop`; `ExifValue` is `Ascii(String)`, `Short(u16)` or `Long(u32)`. The last edit of a tag wins. The three IFD pointer tags (`0x8769`, `0x8825`, `0xA005`) cannot be edited (`ExifError::PointerTag`).
+- **How `patch_exif` keeps bytes still.** A value of four bytes or fewer is written into its entry (a `SHORT` may become a `LONG` in the same slot). A longer one is written over the old value if it fits and nothing else points into it, and otherwise placed in free space and its entry repointed. An IFD that gains an entry is copied, in tag order, to free space and its parent's pointer updated, children before parents. `DropThumbnail` sets IFD0's next-IFD offset to 0. Freed bytes — old values, old tables, IFD1, the thumbnail — are zeroed **only where no parsed entry still points into them**; freed bytes that end the block are cut off, and the rest are reused before the block grows. A thumbnail stored last, as Lightroom and most cameras store it, therefore shrinks the block.
+- **Hostile input.** The header and IFD0 must parse (`ExifError::Malformed` otherwise); a sub-IFD or IFD1 pointing outside the block or onto another IFD's table is treated as absent; every value range is overflow-checked against the block; an IFD at its 65,535-entry limit gains nothing; nothing panics (tested by truncating and flipping every byte of the fixtures). An entry of a type whose size is unknown turns off zeroing and trimming, since its extent cannot be seen.
+- **The residual risk** is one every EXIF editor shares: a MakerNote whose own pointers reach outside its declared extent, into bytes that are freed. Freed bytes are zeroed only where no parsed entry overlaps them, so this needs a maker to point at another tag's old value or at the thumbnail, which none is known to do.
+- **`MAX_JPEG_EXIF_LEN`** (65,527) is what one JPEG `APP1` holds; a caller checks a patched block against it and rebuilds when it is over. `Rebuilt::maker_note_dropped` says whether that cost a MakerNote.
+
+```rust
+use rust_sak::image::{ExifEdit, ExifIfd, ExifValue, exif_field, patch_exif};
+
+// Big-endian, IFD0 with one entry: Orientation = 6.
+let exif = b"MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0\x06\0\0\0\0\0\0";
+let edits = [
+    ExifEdit::Set { ifd: ExifIfd::Primary, tag: 0x0131, value: ExifValue::Ascii("My Editor 2.0".into()) },
+    ExifEdit::DropThumbnail,
+];
+let patched = patch_exif(exif, &edits).unwrap();
+assert_eq!(exif_field(&patched, ExifIfd::Primary, 0x0112), Some(ExifValue::Short(6)));
+```
+
 > **Added after 26.10.6:** `icc_profile_bytes`, `icc_profile_file`, `icc_profile_description`, `Metadata`, `Embedded`, `encode_file_with` and `encode_writer_with`. TIFF now encodes through `TiffEncoder` rather than `DynamicImage::write_to` (the bytes are unchanged), and `probe_bytes`/`probe_file` now report a TIFF's embedded profile name on small images too, where the `image` crate's reader limits used to hide it. (Fork tag `26.10.6-color.1`.)
 >
 > **Then:** `metadata_bytes`, and the `exif`, `xmp` and `iptc` fields of `Metadata` and `Embedded`, written by `encode_*_with` into JPEG, PNG and WebP. (Fork tag `26.10.6-meta.1`.)
+>
+> **Then:** `exif_field`, `patch_exif`, `rebuild_exif`, `ExifEdit`, `ExifIfd`, `ExifValue`, `ExifError`, `Rebuilt` and `MAX_JPEG_EXIF_LEN`. (Fork tag `26.10.6-meta.2`.)
 
 ## RAW decoding (`image-raw`)
 

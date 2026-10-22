@@ -19,6 +19,8 @@
 //!   decoding the pixels, and [`icc_profile_description`] to name one.
 //! - [`encode_file`] — encode and save to a path, format chosen from its extension.
 //! - [`encode_writer`] — encode and write to any [`Write`](std::io::Write) sink with an explicit [`ImageFormat`].
+//! - [`exif_field`], [`patch_exif`] and [`rebuild_exif`] — read one EXIF field, and change fields without moving the
+//!   bytes that are kept (so a MakerNote stays valid), or rebuild compactly without the MakerNote.
 //! - [`metadata_bytes`] — read everything a [`Metadata`] carries (ICC profile, EXIF, XMP, IPTC) without decoding the
 //!   pixels.
 //! - [`encode_file_with`] / [`encode_writer_with`] — the same, embedding the [`Metadata`] given (an ICC profile, EXIF,
@@ -84,6 +86,7 @@ mod encode_file_with;
 mod encode_writer;
 mod encode_writer_with;
 mod error;
+mod exif;
 mod fit;
 mod format;
 mod format_from_bytes;
@@ -110,6 +113,9 @@ pub use encode_file_with::encode_file_with;
 pub use encode_writer::encode_writer;
 pub use encode_writer_with::encode_writer_with;
 pub use error::{ImageError, Result};
+pub use exif::{
+    ExifEdit, ExifError, ExifIfd, ExifValue, MAX_JPEG_EXIF_LEN, Rebuilt, exif_field, patch_exif, rebuild_exif,
+};
 pub use fit::fit;
 pub use format::ImageFormat;
 pub use format_from_bytes::format_from_bytes;
