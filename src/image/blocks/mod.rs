@@ -11,10 +11,13 @@
 
 mod exif;
 pub(super) mod jpeg;
+mod mpf;
 pub(super) mod png;
 mod webp;
 mod xmp;
 
+#[cfg(test)]
+mod gain_map_tests;
 #[cfg(test)]
 mod tests;
 
@@ -25,12 +28,19 @@ use super::{ImageFormat, Metadata};
 /// block, so the bound is what keeps a hostile one from allocating without limit.
 pub(super) const MAX_BLOCK_LEN: usize = 16 * 1024 * 1024;
 
-/// The three descriptive blocks of a file, borrowed or owned as the reader found them.
+/// The largest gain-map image read out of a JPEG or written into one. A gain map is at most the primary's size and is
+/// usually a quarter of it or less; a 100-megapixel photograph's full-resolution gain map at high quality is well under
+/// this. It is copied from the file, so it is also never more than the file's own size.
+pub(super) const MAX_GAIN_MAP_LEN: usize = 64 * 1024 * 1024;
+
+/// The three descriptive blocks of a file, and a JPEG's gain-map container blocks, as the reader found them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct Blocks {
     pub(super) exif: Option<Vec<u8>>,
     pub(super) xmp: Option<Vec<u8>>,
     pub(super) iptc: Option<Vec<u8>>,
+    pub(super) iso_gain_map: Option<Vec<u8>>,
+    pub(super) gain_map: Option<Vec<u8>>,
 }
 
 /// Reads the EXIF, XMP and IPTC blocks of `bytes`, known to be in `format`. Formats without a reader yet (TIFF, AVIF,
@@ -45,12 +55,14 @@ pub(super) fn read(bytes: &[u8], format: ImageFormat) -> Blocks {
 }
 
 /// What of `metadata` a splice into an encoded file has to write: the three descriptive blocks, each only if present
-/// and within [`MAX_BLOCK_LEN`].
+/// and within [`MAX_BLOCK_LEN`], and the gain-map blocks only a JPEG holds (the gain map within [`MAX_GAIN_MAP_LEN`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct ToWrite<'a> {
     pub(super) exif: Option<&'a [u8]>,
     pub(super) xmp: Option<&'a [u8]>,
     pub(super) iptc: Option<&'a [u8]>,
+    pub(super) iso_gain_map: Option<&'a [u8]>,
+    pub(super) gain_map: Option<&'a [u8]>,
 }
 
 impl<'a> ToWrite<'a> {
@@ -60,12 +72,30 @@ impl<'a> ToWrite<'a> {
             exif: bounded(&metadata.exif),
             xmp: bounded(&metadata.xmp),
             iptc: bounded(&metadata.iptc),
+            iso_gain_map: bounded(&metadata.iso_gain_map),
+            gain_map: metadata
+                .gain_map
+                .as_deref()
+                .filter(|image| image.len() <= MAX_GAIN_MAP_LEN),
         }
     }
 
     /// Whether there is nothing to splice, in which case the encoder's output is written as it stands.
     pub(super) fn is_empty(&self) -> bool {
-        self.exif.is_none() && self.xmp.is_none() && self.iptc.is_none()
+        self.exif.is_none()
+            && self.xmp.is_none()
+            && self.iptc.is_none()
+            && self.iso_gain_map.is_none()
+            && self.gain_map.is_none()
+    }
+
+    /// These blocks without the ones only a JPEG can hold, for a format that has no place for them.
+    pub(super) fn descriptive(self) -> Self {
+        Self {
+            iso_gain_map: None,
+            gain_map: None,
+            ..self
+        }
     }
 }
 
@@ -75,6 +105,8 @@ pub(super) struct Wrote {
     pub(super) exif: bool,
     pub(super) xmp: bool,
     pub(super) iptc: bool,
+    pub(super) iso_gain_map: bool,
+    pub(super) gain_map: bool,
 }
 
 /// `encoded`, a file the `format` encoder just wrote, with the blocks of `blocks` it can hold spliced in, and which
@@ -83,7 +115,7 @@ pub(super) struct Wrote {
 pub(super) fn splice(encoded: &[u8], format: ImageFormat, blocks: ToWrite<'_>) -> Option<(Vec<u8>, Wrote)> {
     match format {
         ImageFormat::Jpeg => jpeg::splice(encoded, blocks),
-        ImageFormat::Png => png::splice(encoded, blocks),
+        ImageFormat::Png => png::splice(encoded, blocks.descriptive()),
         _ => None,
     }
 }

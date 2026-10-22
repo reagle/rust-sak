@@ -1,6 +1,7 @@
-//! JPEG: the `APP1` EXIF and XMP segments (extended XMP included) and the `APP13` Photoshop segments.
+//! JPEG: the `APP1` EXIF and XMP segments (extended XMP included), the `APP13` Photoshop segments, and the gain-map
+//! container — the `APP2` ISO 21496-1 segment and the MPF gain-map image after the primary's `EOI`.
 
-use super::{Blocks, MAX_BLOCK_LEN, ToWrite, Wrote, be_u16, be_u32, exif, xmp};
+use super::{Blocks, MAX_BLOCK_LEN, MAX_GAIN_MAP_LEN, ToWrite, Wrote, be_u16, be_u32, exif, mpf, xmp};
 
 const SOI: u8 = 0xD8;
 const EOI: u8 = 0xD9;
@@ -14,16 +15,13 @@ const EXIF_HEADER: &[u8] = b"Exif\0\0";
 const XMP_HEADER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 const EXTENDED_HEADER: &[u8] = b"http://ns.adobe.com/xmp/extension/\0";
 const PHOTOSHOP_HEADER: &[u8] = b"Photoshop 3.0\0";
-/// The ISO 21496-1 gain-map version marker's `APP2` header.
+/// The ISO 21496-1 gain-map `APP2` header: a primary's version marker, or a gain-map image's metadata.
 const ISO_GAIN_MAP_HEADER: &[u8] = b"urn:iso:std:iso:ts:21496:-1\0";
-/// The CIPA DC-007 Multi-Picture Format `APP2` header.
-const MPF_HEADER: &[u8] = b"MPF\0";
 /// The namespace of Adobe's and Android's (Ultra HDR) gain-map XMP description, `hdrgm:`.
 const HDRGM_NAMESPACE: &[u8] = b"http://ns.adobe.com/hdr-gain-map/1.0/";
-/// MPF's `MPEntry` tag, whose value is one 16-byte entry per image.
-const MP_ENTRY: u16 = 0xB002;
-/// The MP Entry image type code of a gain map (CIPA DC-007, the low 24 bits of an entry's attribute).
-const MP_TYPE_GAIN_MAP: u32 = 0x05_0000;
+/// How many secondary MP Entries are looked at for the gain map: a gain-map JPEG has one, and a phone's may put a
+/// depth map or a preview beside it.
+const SECONDARY_ENTRIES: usize = 2;
 
 /// The most data one segment holds: its length field counts itself, and is 16 bits.
 const MAX_SEGMENT_DATA: usize = 65_535 - 2;
@@ -33,6 +31,8 @@ pub(super) const MAX_EXIF_LEN: usize = MAX_SEGMENT_DATA - EXIF_HEADER.len();
 const EXTENDED_CHUNK_LEN: usize = MAX_SEGMENT_DATA - EXTENDED_HEADER.len() - 32 - 4 - 4;
 /// The most of a Photoshop resource block one `APP13` carries.
 const PHOTOSHOP_CHUNK_LEN: usize = MAX_SEGMENT_DATA - PHOTOSHOP_HEADER.len();
+/// The largest ISO 21496-1 payload one `APP2` carries; it is never split.
+const MAX_ISO_GAIN_MAP_LEN: usize = MAX_SEGMENT_DATA - ISO_GAIN_MAP_HEADER.len();
 
 /// The marker segments ahead of the first scan, as `(marker, data, offset of the marker's 0xFF)`. Stops at `SOS`,
 /// `EOI`, or the first thing that is not a well-formed segment, so a truncated file yields the segments before the cut.
@@ -73,81 +73,66 @@ fn segments(bytes: &[u8]) -> impl Iterator<Item = (u8, &[u8], usize)> {
 /// image's first `SOS` is read, so the gain map itself, and a malformed file, cost nothing.
 pub(in crate::image) fn has_gain_map(bytes: &[u8]) -> bool {
     segments(bytes).any(|(marker, data, _)| match marker {
-        APP2 => data.starts_with(ISO_GAIN_MAP_HEADER) || mpf_has_gain_map(data),
+        APP2 => data.starts_with(ISO_GAIN_MAP_HEADER) || mpf::has_gain_map(data),
         APP1 => data.starts_with(XMP_HEADER) && xmp::contains(&data[XMP_HEADER.len()..], HDRGM_NAMESPACE),
         _ => false,
     })
 }
 
-/// Whether the `APP2` segment `data` is an MPF index with an entry of type Gain Map. Every read is bounded by the
-/// segment: the entries are read from the bytes present, never from a count the file claims.
-fn mpf_has_gain_map(data: &[u8]) -> bool {
-    let Some(tiff) = data.strip_prefix(MPF_HEADER) else {
-        return false;
-    };
-    let big = match tiff.get(0..4) {
-        Some(b"MM\0\x2a") => true,
-        Some(b"II\x2a\0") => false,
-        _ => return false,
-    };
-    let u16_at = |at: usize| {
-        let pair: [u8; 2] = tiff.get(at..at.checked_add(2)?)?.try_into().ok()?;
-        Some(if big {
-            u16::from_be_bytes(pair)
-        } else {
-            u16::from_le_bytes(pair)
-        })
-    };
-    let u32_at = |at: usize| {
-        let quad: [u8; 4] = tiff.get(at..at.checked_add(4)?)?.try_into().ok()?;
-        Some(if big {
-            u32::from_be_bytes(quad)
-        } else {
-            u32::from_le_bytes(quad)
-        })
-    };
+/// The gain-map image the MP Index `data` locates in `bytes`, the index's TIFF header being at `tiff_at` in it: the
+/// first of the secondary entries of type Gain Map; failing that, when the primary `declared` a gain map (an Android
+/// file whose secondary entry has type 0), the first secondary entry.
+///
+/// Located by the entry's offset and size alone — never by the primary's recorded size, which an editor may have left
+/// stale — and then checked: it must lie inside `bytes` after the index, start with `SOI`, hold an `EOI` (where the
+/// image is cut, dropping any padding after it), and be no larger than [`MAX_GAIN_MAP_LEN`]. Otherwise there is none.
+fn gain_map_image<'a>(bytes: &'a [u8], tiff_at: usize, data: &[u8], declared: bool) -> Option<&'a [u8]> {
+    let mut secondary = mpf::entries(data).skip(1).take(SECONDARY_ENTRIES);
+    let first = secondary.next();
+    let entry = first
+        .into_iter()
+        .chain(secondary)
+        .find(|entry| entry.is_gain_map())
+        .or(first.filter(|_| declared))?;
 
-    let found = (|| {
-        let ifd = usize::try_from(u32_at(4)?).ok()?;
-        let count = usize::from(u16_at(ifd)?);
-        let entry = (0..count)
-            .map_while(|i| ifd.checked_add(2)?.checked_add(i.checked_mul(12)?))
-            .take_while(|&at| at.checked_add(12).is_some_and(|end| end <= tiff.len()))
-            .find(|&at| u16_at(at) == Some(MP_ENTRY))?;
-        let length = usize::try_from(u32_at(entry + 4)?).ok()?;
-        let offset = usize::try_from(u32_at(entry + 8)?).ok()?;
-        let table = tiff.get(offset..offset.checked_add(length)?)?;
-        Some(
-            table
-                .as_chunks::<16>()
-                .0
-                .iter()
-                .any(|image| attribute(image, big) & 0x00FF_FFFF == MP_TYPE_GAIN_MAP),
-        )
-    })();
-    found.unwrap_or(false)
-}
-
-/// The first four bytes of `image`, an MP Entry, as its attribute in the index's byte order.
-fn attribute(image: &[u8; 16], big: bool) -> u32 {
-    let quad = [image[0], image[1], image[2], image[3]];
-    if big {
-        u32::from_be_bytes(quad)
-    } else {
-        u32::from_le_bytes(quad)
+    let size = usize::try_from(entry.size).ok()?;
+    let start = tiff_at.checked_add(usize::try_from(entry.offset).ok()?)?;
+    // After the index itself, which is after `SOI`: an offset of zero names the primary.
+    let index_end = tiff_at.checked_add(data.len() - mpf::HEADER.len())?;
+    if start < index_end || size > MAX_GAIN_MAP_LEN {
+        return None;
     }
+    let image = bytes.get(start..start.checked_add(size)?)?;
+    if !image.starts_with(&[0xFF, SOI, 0xFF]) {
+        return None;
+    }
+    let end = image.windows(2).rposition(|pair| pair == [0xFF, EOI])?;
+    Some(&image[..end + 2])
 }
 
-/// Reads a JPEG's EXIF, XMP and IPTC.
+/// Reads a JPEG's EXIF, XMP and IPTC, its ISO 21496-1 payload, and its gain-map image.
 pub(super) fn read(bytes: &[u8]) -> Blocks {
     let mut blocks = Blocks::default();
     let mut standard: Option<&[u8]> = None;
     // Extended XMP chunks by GUID: (full length, offset, data).
     let mut extended: Vec<(&[u8], u32, u32, &[u8])> = Vec::new();
     let mut photoshop: Option<Vec<u8>> = None;
+    // The first MP Index, and where its TIFF header is in `bytes`.
+    let mut index: Option<(usize, &[u8])> = None;
 
     for (marker, data, _) in segments(bytes) {
         match marker {
+            APP2 if data.starts_with(ISO_GAIN_MAP_HEADER) => {
+                blocks
+                    .iso_gain_map
+                    .get_or_insert_with(|| data[ISO_GAIN_MAP_HEADER.len()..].to_vec());
+            }
+            APP2 if data.starts_with(mpf::HEADER) && index.is_none() => {
+                // `data` is a slice of `bytes`, so the difference of their starts is where it is; the TIFF header
+                // follows the `MPF\0`.
+                let at = (data.as_ptr() as usize - bytes.as_ptr() as usize) + mpf::HEADER.len();
+                index = Some((at, data));
+            }
             APP1 if data.starts_with(EXIF_HEADER) => {
                 if blocks.exif.is_none() {
                     let block = &data[EXIF_HEADER.len()..];
@@ -177,9 +162,13 @@ pub(super) fn read(bytes: &[u8]) -> Blocks {
     }
 
     blocks.iptc = photoshop.filter(|block| block.starts_with(b"8BIM"));
-    blocks.xmp = standard
-        .filter(|packet| xmp::plausible(packet))
-        .map(|packet| with_extended(packet, &extended));
+    let standard = standard.filter(|packet| xmp::plausible(packet));
+    let declared =
+        blocks.iso_gain_map.is_some() || standard.is_some_and(|packet| xmp::contains(packet, HDRGM_NAMESPACE));
+    blocks.xmp = standard.map(|packet| with_extended(packet, &extended));
+    blocks.gain_map = index
+        .and_then(|(tiff_at, data)| gain_map_image(bytes, tiff_at, data, declared))
+        .map(<[u8]>::to_vec);
     blocks
 }
 
@@ -226,7 +215,12 @@ fn with_extended(standard: &[u8], chunks: &[(&[u8], u32, u32, &[u8])]) -> Vec<u8
 }
 
 /// `encoded` with `blocks` inserted after its `APP0` (or straight after `SOI` if it has none): `APP1` EXIF, then `APP1`
-/// XMP and any extended XMP, then `APP13`.
+/// XMP and any extended XMP, then `APP13`, then the `APP2` ISO 21496-1 segment, then — with a gain map — the `APP2` MP
+/// Index; and the gain-map image appended after `encoded`'s `EOI`, the index patched with both images' sizes and the
+/// gain map's offset.
+///
+/// An ISO payload too large for one segment, or a gain map that is not a complete JPEG (`SOI` to a final `EOI`), is
+/// left out and reported unwritten; so is the gain map when `encoded` does not end at its `EOI`.
 pub(super) fn splice(encoded: &[u8], blocks: ToWrite<'_>) -> Option<(Vec<u8>, Wrote)> {
     let first = segments(encoded).next();
     // The `JFIF` (or `JFXX`) segment, which must stay first.
@@ -267,12 +261,45 @@ pub(super) fn splice(encoded: &[u8], blocks: ToWrite<'_>) -> Option<(Vec<u8>, Wr
         }
         wrote.iptc = true;
     }
+    if let Some(payload) = blocks
+        .iso_gain_map
+        .filter(|payload| payload.len() <= MAX_ISO_GAIN_MAP_LEN)
+    {
+        push_segment(&mut inserted, APP2, &[ISO_GAIN_MAP_HEADER, payload]);
+        wrote.iso_gain_map = true;
+    }
+    let gain_map = blocks
+        .gain_map
+        .filter(|image| is_complete(image) && is_complete(encoded));
+    // Where the index segment starts in the output.
+    let index_at = gain_map.map(|_| {
+        let at = insert_at + inserted.len();
+        inserted.extend_from_slice(&mpf::index());
+        at
+    });
 
-    let mut out = Vec::with_capacity(encoded.len() + inserted.len());
+    let appended = gain_map.map_or(0, <[u8]>::len);
+    let mut out = Vec::with_capacity(encoded.len() + inserted.len() + appended);
     out.extend_from_slice(&encoded[..insert_at]);
     out.extend_from_slice(&inserted);
     out.extend_from_slice(&encoded[insert_at..]);
+
+    if let (Some(image), Some(at)) = (gain_map, index_at) {
+        let primary = out.len();
+        if mpf::patch(&mut out, at, primary, image.len()).is_some() {
+            out.extend_from_slice(image);
+            wrote.gain_map = true;
+        } else {
+            // Sizes past 4 GiB: the index cannot describe them, so it goes and the file is the primary alone.
+            out.drain(at..at + mpf::INDEX_LEN);
+        }
+    }
     Some((out, wrote))
+}
+
+/// Whether `image` is a whole JPEG as far as its ends go: `SOI` and a marker first, `EOI` last.
+fn is_complete(image: &[u8]) -> bool {
+    image.starts_with(&[0xFF, SOI, 0xFF]) && image.ends_with(&[0xFF, EOI])
 }
 
 /// Appends one marker segment whose data is `parts` joined. The caller keeps the data within [`MAX_SEGMENT_DATA`].

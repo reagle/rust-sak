@@ -512,6 +512,8 @@ fn spliced<W: Write>(
             embedded.exif = wrote.exif;
             embedded.xmp = wrote.xmp;
             embedded.iptc = wrote.iptc;
+            embedded.iso_gain_map = wrote.iso_gain_map;
+            embedded.gain_map = wrote.gain_map;
         }
         None => writer.write_all(&plain)?,
     }
