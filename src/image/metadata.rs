@@ -22,12 +22,25 @@ pub struct Metadata {
     /// included. Embedded in JPEG (`APP2`, split across segments above 64 KiB), PNG (`iCCP`), TIFF (tag 34675) and
     /// WebP (`ICCP`); BMP, GIF, AVIF and HEIF cannot carry it yet.
     pub icc_profile: Option<Vec<u8>>,
+    /// An EXIF block, as read by [`metadata_bytes`](super::metadata_bytes): the TIFF stream itself, from its `II`/`MM`
+    /// byte-order mark on, **without** the `Exif\0\0` prefix a JPEG puts in front of it — the form PNG `eXIf`, WebP
+    /// `EXIF` and the HEIF `Exif` item all use. Embedded in JPEG (`APP1`, at most 65,527 bytes), PNG (`eXIf`) and WebP
+    /// (`EXIF`). Offsets inside it are relative to its own first byte, so it is valid in all three as it stands.
+    pub exif: Option<Vec<u8>>,
+    /// An XMP packet: one whole serialized `x:xmpmeta` document, normally wrapped in `<?xpacket?>` instructions, in
+    /// UTF-8. A JPEG source's extended XMP has already been merged into it. Embedded in JPEG (`APP1`, re-split into
+    /// standard and extended XMP above 65,502 bytes), PNG (`iTXt` with keyword `XML:com.adobe.xmp`) and WebP (`XMP `).
+    pub xmp: Option<Vec<u8>>,
+    /// A Photoshop image-resource block (a sequence of `8BIM` resources), as a JPEG carries it in `APP13`
+    /// `Photoshop 3.0`. The IPTC-IIM data is its resource `0x0404`. Embedded in JPEG only (split across `APP13`
+    /// segments above 65,519 bytes); no other format has a standard place for it.
+    pub iptc: Option<Vec<u8>>,
 }
 
 impl Metadata {
     /// Whether there is nothing to embed.
     pub fn is_empty(&self) -> bool {
-        self.icc_profile.is_none()
+        self.icc_profile.is_none() && self.exif.is_none() && self.xmp.is_none() && self.iptc.is_none()
     }
 }
 
@@ -44,4 +57,10 @@ impl Metadata {
 pub struct Embedded {
     /// The [`Metadata::icc_profile`] was written into the file.
     pub icc_profile: bool,
+    /// The [`Metadata::exif`] block was written into the file.
+    pub exif: bool,
+    /// The [`Metadata::xmp`] packet was written into the file.
+    pub xmp: bool,
+    /// The [`Metadata::iptc`] block was written into the file.
+    pub iptc: bool,
 }

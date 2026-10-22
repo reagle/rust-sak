@@ -153,6 +153,24 @@ mod image {
     }
 
     #[test]
+    fn exif_xmp_and_iptc_round_trip_through_the_public_api() {
+        use rust_sak::image::{Embedded, Metadata, encode_writer_with, metadata_bytes};
+
+        let mut metadata = Metadata::default();
+        metadata.exif = Some(b"II\x2a\0\x08\0\0\0\0\0\0\0\0\0".to_vec());
+        metadata.xmp = Some(b"<x:xmpmeta xmlns:x='adobe:ns:meta/'/>".to_vec());
+        metadata.iptc = Some(b"8BIM\x04\x04\0\0\0\0\0\0".to_vec());
+        assert!(!metadata.is_empty());
+
+        let original = image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4));
+        let mut bytes = Vec::new();
+        let embedded: Embedded = encode_writer_with(&original, &mut bytes, ImageFormat::Jpeg, None, &metadata).unwrap();
+
+        assert!(embedded.exif && embedded.xmp && embedded.iptc && !embedded.icc_profile);
+        assert_eq!(metadata_bytes(&bytes), metadata);
+    }
+
+    #[test]
     fn rotate_is_reachable_and_expands_the_canvas() {
         let original = image::DynamicImage::ImageRgb8(image::RgbImage::new(240, 120));
         let rotated = rotate(&original, 30.0);

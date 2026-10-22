@@ -1236,6 +1236,7 @@ mod color_profile {
     fn with_profile(profile: &[u8]) -> Metadata {
         Metadata {
             icc_profile: Some(profile.to_vec()),
+            ..Metadata::default()
         }
     }
 
@@ -1488,7 +1489,16 @@ mod color_profile {
 
     #[test]
     fn the_webp_rewrite_refuses_what_it_cannot_parse_without_panicking() {
-        use super::super::riff::with_iccp;
+        use super::super::riff::{Chunks, with_chunks};
+        let with_iccp = |webp: &[u8], profile: &[u8]| {
+            with_chunks(
+                webp,
+                Chunks {
+                    icc: Some(profile),
+                    ..Chunks::default()
+                },
+            )
+        };
 
         let profile = icc_v4(&[("en", "Display P3")]);
         assert_eq!(with_iccp(b"", &profile), None);
