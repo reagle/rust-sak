@@ -12,13 +12,13 @@ use super::{Embedded, EncodeOptions, ImageFormat, Metadata};
 /// [`encode_writer`](super::encode_writer) with a [`Metadata`] to carry. Each block is written byte for byte where the
 /// format can hold it:
 ///
-/// | Format | ICC profile |
-/// |---|---|
-/// | JPEG | `APP2` `ICC_PROFILE` segments, split above 64 KiB (up to 255 × 65,519 bytes) |
-/// | PNG | `iCCP` (compressed) |
-/// | TIFF | tag 34675 (`InterColorProfile`) |
-/// | WebP | `ICCP` chunk, with a `VP8X` header added or updated |
-/// | BMP, GIF, AVIF, HEIF | not written |
+/// | Format | ICC profile | EXIF | XMP | IPTC |
+/// |---|---|---|---|---|
+/// | JPEG | `APP2` `ICC_PROFILE` segments, split above 64 KiB (up to 255 × 65,519 bytes) | `APP1` (up to 65,527 bytes) | `APP1`, extended XMP above 65,502 bytes | `APP13` |
+/// | PNG | `iCCP` (compressed) | `eXIf` | `iTXt` | not written |
+/// | TIFF | tag 34675 (`InterColorProfile`) | not written yet | not written yet | not written yet |
+/// | WebP | `ICCP` chunk, with a `VP8X` header added or updated | `EXIF` | `XMP ` | not written |
+/// | BMP, GIF, AVIF, HEIF | not written | not written | not written | not written |
 ///
 /// A block the format cannot hold is left out and reported `false` in the returned [`Embedded`]; the encode still
 /// succeeds. With [`Metadata::default()`] the bytes are exactly those [`encode_writer`](super::encode_writer) writes.
@@ -29,8 +29,9 @@ use super::{Embedded, EncodeOptions, ImageFormat, Metadata};
 /// than `format`, [`ImageError::Io`](super::ImageError::Io) if `writer` fails, and the codec's own error if encoding
 /// fails. Never because of `metadata`.
 ///
-/// BMP, GIF and TIFF are buffered whole before being written, as with [`encode_writer`](super::encode_writer), and so
-/// is a WebP with a profile to embed, whose chunks are rewritten once libwebp has finished.
+/// BMP, GIF and TIFF are buffered whole before being written, as with [`encode_writer`](super::encode_writer). So are a
+/// JPEG, PNG or WebP with EXIF, XMP or IPTC to embed, and a WebP with a profile, whose segments or chunks are spliced in
+/// once the codec has finished; without them those three stream straight to `writer`.
 ///
 /// ```
 /// use image::{DynamicImage, RgbImage};

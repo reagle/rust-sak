@@ -19,8 +19,10 @@
 //!   decoding the pixels, and [`icc_profile_description`] to name one.
 //! - [`encode_file`] — encode and save to a path, format chosen from its extension.
 //! - [`encode_writer`] — encode and write to any [`Write`](std::io::Write) sink with an explicit [`ImageFormat`].
-//! - [`encode_file_with`] / [`encode_writer_with`] — the same, embedding the [`Metadata`] given (an ICC profile) where
-//!   the format can hold it, and reporting what was written as [`Embedded`].
+//! - [`metadata_bytes`] — read everything a [`Metadata`] carries (ICC profile, EXIF, XMP, IPTC) without decoding the
+//!   pixels.
+//! - [`encode_file_with`] / [`encode_writer_with`] — the same, embedding the [`Metadata`] given (an ICC profile, EXIF,
+//!   XMP, IPTC) where the format can hold it, and reporting what was written as [`Embedded`].
 //!
 //! Lossy/codec-specific settings are supplied per format via [`EncodeOptions`]; pass `None` to use sensible defaults.
 //!
@@ -71,6 +73,7 @@
 // examples into doctests, so the prose cannot drift from the code without CI noticing.
 #![doc = include_str!("README.md")]
 
+mod blocks;
 mod container;
 mod decode_bytes;
 mod decode_bytes_with_format;
@@ -90,6 +93,7 @@ mod icc_profile_description;
 mod icc_profile_file;
 mod info;
 mod metadata;
+mod metadata_bytes;
 mod options;
 mod probe_bytes;
 mod probe_file;
@@ -114,6 +118,7 @@ pub use icc_profile_description::icc_profile_description;
 pub use icc_profile_file::icc_profile_file;
 pub use info::ImageInfo;
 pub use metadata::{Embedded, Metadata};
+pub use metadata_bytes::metadata_bytes;
 pub use options::{Chroma, EncodeOptions, PngCompression, PngFilter, Preset};
 pub use probe_bytes::probe_bytes;
 pub use probe_file::probe_file;

@@ -1,0 +1,15 @@
+-EXIF:Make=FixtureCam
+-EXIF:Model=Model One
+-EXIF:Orientation#=6
+-EXIF:DateTimeOriginal=2026:10:18 16:03:50
+-EXIF:OffsetTimeOriginal=-04:00
+-EXIF:GPSLatitude=42.37
+-EXIF:GPSLatitudeRef=N
+-EXIF:GPSLongitude=71.14
+-EXIF:GPSLongitudeRef=W
+-EXIF:Software=Fixture Writer 1.0
+-XMP-dc:Subject=hawk
+-XMP-dc:Subject=bird
+-XMP-dc:Title=Fixture title
+-XMP-xmp:Rating=3
+-XMP-xmp:CreatorTool=Fixture Writer 1.0

@@ -3346,6 +3346,7 @@ version = "26.11.0"
 dependencies = [
  "avif-rs",
  "cap-std",
+ "crc32fast",
  "ctor",
  "dirs",
  "enough",
@@ -3360,6 +3361,8 @@ dependencies = [
  "libloading 0.9.0",
  "liblzma",
  "machine-uid",
+ "md5",
+ "miniz_oxide 0.8.9",
  "moka",
  "o11y-macros",
  "objc2",

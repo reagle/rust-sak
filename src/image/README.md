@@ -54,6 +54,7 @@ are pure pixel arithmetic with nothing to fail, so they return their picture dir
 | `icc_profile_bytes` | `fn icc_profile_bytes(bytes: &[u8]) -> Result<Option<Vec<u8>>>` | The **exact bytes** of the embedded ICC colour profile, from the header; format from **magic bytes**. No pixel decode. See [Colour profiles](#colour-profiles). |
 | `icc_profile_description` | `fn icc_profile_description(profile: &[u8]) -> Option<String>` | A profile's own description (`Display P3`), as `ImageInfo::color_profile` reports it. |
 | `icc_profile_file`  | `fn icc_profile_file(path: impl AsRef<Path>) -> Result<Option<Vec<u8>>>` | Same, for a file; format from the **extension**. Reads only the header for native formats, a 64 KiB prefix (or the whole file, if the profile lies further in) for the containers. |
+| `metadata_bytes`    | `fn metadata_bytes(bytes: &[u8]) -> Metadata` | Everything `Metadata` carries — ICC profile, EXIF, XMP, IPTC — **byte for byte**; format from **magic bytes**. Infallible. See [Metadata blocks](#metadata-blocks). |
 
 ### Transforming
 
@@ -123,7 +124,7 @@ A picture the target already accepts is **not** converted — it is handed to th
 | AVIF, HEIF | the primary item's `colr` box of type `prof`/`rICC` (an `nclx`-only file has none) | not written yet |
 | BMP, GIF | none | not written |
 
-- **`Metadata`** is what an encode embeds: `icc_profile: Option<Vec<u8>>`. It is `#[non_exhaustive]` so further blocks can join it — build it with `Metadata::default()` and assign the fields. `Metadata::default()` writes exactly what `encode_file` / `encode_writer` write; those two are wrappers that pass it.
+- **`Metadata`** is what an encode embeds: `icc_profile: Option<Vec<u8>>`, and the EXIF, XMP and IPTC blocks described [below](#metadata-blocks). It is `#[non_exhaustive]` so further blocks can join it — build it with `Metadata::default()` and assign the fields. `Metadata::default()` writes exactly what `encode_file` / `encode_writer` write; those two are wrappers that pass it.
 - **`Embedded`** is what was actually written, one `bool` per `Metadata` field. A format that cannot hold a block, or a block too large for it, reports `false` — **the encode itself never fails because of metadata**.
 - **Untrusted input is bounded.** A profile under the 128-byte ICC header, without the `acsp` signature, or over 16 MiB reads as `None`; truncated or malformed containers read as `None` rather than an error, and nothing panics.
 
@@ -145,7 +146,45 @@ let embedded = encode_writer_with(
 assert!(!embedded.icc_profile);
 ```
 
-> **Added after 26.10.8:** `icc_profile_bytes`, `icc_profile_file`, `icc_profile_description`, `Metadata`, `Embedded`, `encode_file_with` and `encode_writer_with`. TIFF now encodes through `TiffEncoder` rather than `DynamicImage::write_to` (the bytes are unchanged), and `probe_bytes`/`probe_file` now report a TIFF's embedded profile name on small images too, where the `image` crate's reader limits used to hide it.
+### Metadata blocks
+
+`metadata_bytes` reads a file's **EXIF**, **XMP** and **IPTC** blocks (and its ICC profile, as above) into a `Metadata`, and `encode_*_with` splices them into the file it encodes, so a program that re-encodes a photograph can keep its capture date, camera, location, keywords and rights. **Every block is carried byte for byte and never interpreted**: which fields to keep, drop or rewrite is the caller's policy, not a codec's.
+
+| Field | What it holds |
+|---|---|
+| `exif` | The EXIF TIFF stream from its `II`/`MM` byte-order mark on, **without** JPEG's `Exif\0\0` prefix — the form PNG, WebP and HEIF use, and one whose internal offsets are valid in all of them. |
+| `xmp` | One whole XMP packet in UTF-8. A JPEG's extended XMP is joined into it. |
+| `iptc` | The Photoshop image-resource block of a JPEG's `APP13` (`8BIM` resources; the IPTC-IIM data is resource `0x0404`). |
+
+| Format | EXIF | XMP | IPTC |
+|---|---|---|---|
+| JPEG | `APP1` `Exif\0\0`, after `APP0`; at most 65,527 bytes | `APP1`; a packet over 65,502 bytes is split into standard and extended XMP | `APP13` `Photoshop 3.0`, split across segments when large |
+| PNG | `eXIf`, before `IDAT` | `iTXt` `XML:com.adobe.xmp` (read compressed or not, written uncompressed) | no place for it |
+| WebP | `EXIF`, after the image data | `XMP `, after `EXIF` | no place for it |
+| TIFF, AVIF, HEIF, BMP, GIF | not read or written yet | not read or written yet | — |
+
+- **Reading is infallible.** A block that is truncated, overruns its container, fails its CRC (PNG), or is not what its container claims — an EXIF block without a TIFF header and an IFD0 inside it, XMP that is not UTF-8, a Photoshop block not starting `8BIM` — reads as `None`, alone; the other blocks are still read. Nothing is larger than 16 MiB, and a compressed `iTXt` is inflated no further than that.
+- **Writing never fails the encode.** `Embedded` reports `exif`, `xmp` and `iptc` like `icc_profile`: `true` only when the block was given and written. When none of the three is given, the encoder's output is streamed as before; otherwise the finished file is buffered once and the segments or chunks inserted, leaving every byte the codec wrote — an embedded ICC profile included — as it was.
+- **Extended XMP** follows the XMP specification (Part 3, 1.1.3.1). On reading, the chunks named by the standard packet's `xmpNote:HasExtendedXMP` GUID are reassembled, checked to tile the declared length exactly, and their `rdf:Description`s moved into the standard packet, whose now-stale reference is removed; an incomplete set leaves the standard packet alone. On writing, a packet too large for one segment becomes a standard packet holding only the reference and an extended packet holding the whole `rdf:RDF`, named by its MD5. Reading that back gives the same `rdf:RDF` contents in a new wrapper, and a further round trip is byte for byte the same. No XML parser is involved, so there is no entity expansion to guard against.
+
+```rust
+use image::{DynamicImage, RgbImage};
+use rust_sak::image::{ImageFormat, Metadata, encode_writer_with, metadata_bytes};
+
+let mut metadata = Metadata::default();
+metadata.xmp = Some(b"<x:xmpmeta xmlns:x='adobe:ns:meta/'/>".to_vec());
+
+let mut png = Vec::new();
+let embedded = encode_writer_with(
+    &DynamicImage::ImageRgb8(RgbImage::new(4, 4)), &mut png, ImageFormat::Png, None, &metadata,
+).unwrap();
+assert!(embedded.xmp && !embedded.iptc);
+assert_eq!(metadata_bytes(&png).xmp, metadata.xmp);
+```
+
+> **Added after 26.10.8:** `icc_profile_bytes`, `icc_profile_file`, `icc_profile_description`, `Metadata`, `Embedded`, `encode_file_with` and `encode_writer_with`. TIFF now encodes through `TiffEncoder` rather than `DynamicImage::write_to` (the bytes are unchanged), and `probe_bytes`/`probe_file` now report a TIFF's embedded profile name on small images too, where the `image` crate's reader limits used to hide it. (Fork tag `26.10.1-color.1`.)
+>
+> **Then:** `metadata_bytes`, and the `exif`, `xmp` and `iptc` fields of `Metadata` and `Embedded`, written by `encode_*_with` into JPEG, PNG and WebP. (Fork tag `26.10.1-meta.1`.)
 
 ## RAW decoding (`image-raw`)
 

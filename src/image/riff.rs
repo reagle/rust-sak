@@ -5,7 +5,7 @@
 //! front of it; an extended one has its `VP8X` flags updated. The RIFF size is recomputed from what is written.
 //!
 //! The chunk order is the one the WebP container specification requires: `VP8X`, then `ICCP`, then everything else
-//! the encoder wrote, in the order it wrote it.
+//! the encoder wrote, in the order it wrote it, then `EXIF`, then `XMP `.
 
 use super::container::riff_chunk;
 
@@ -13,46 +13,95 @@ use super::container::riff_chunk;
 const VP8X_ICC: u8 = 0x20;
 /// The `VP8X` flag that says the image has an alpha channel.
 const VP8X_ALPHA: u8 = 0x10;
+/// The `VP8X` flag that says an `EXIF` chunk follows the image data.
+const VP8X_EXIF: u8 = 0x08;
+/// The `VP8X` flag that says an `XMP ` chunk follows the image data.
+const VP8X_XMP: u8 = 0x04;
 
-/// Returns `webp` with `profile` embedded as its `ICCP` chunk, replacing any profile already there, or `None` when
-/// `webp` is not a WebP file this can rewrite (malformed, truncated, or too large for RIFF once the profile is added).
-pub(super) fn with_iccp(webp: &[u8], profile: &[u8]) -> Option<Vec<u8>> {
+/// What to embed in a WebP: each chunk's data, or `None` to leave that chunk as the encoder wrote it.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Chunks<'a> {
+    /// The `ICCP` chunk: an ICC profile.
+    pub(super) icc: Option<&'a [u8]>,
+    /// The `EXIF` chunk: a TIFF stream.
+    pub(super) exif: Option<&'a [u8]>,
+    /// The `XMP ` chunk: an XMP packet.
+    pub(super) xmp: Option<&'a [u8]>,
+}
+
+impl Chunks<'_> {
+    /// Whether there is nothing to embed.
+    pub(super) fn is_empty(&self) -> bool {
+        self.icc.is_none() && self.exif.is_none() && self.xmp.is_none()
+    }
+
+    /// The `VP8X` flags these chunks need set.
+    fn flags(&self) -> u8 {
+        let flag = |present: bool, flag: u8| if present { flag } else { 0 };
+        flag(self.icc.is_some(), VP8X_ICC) | flag(self.exif.is_some(), VP8X_EXIF) | flag(self.xmp.is_some(), VP8X_XMP)
+    }
+}
+
+/// Returns `webp` with `chunks` embedded, each replacing any chunk of its kind already there, or `None` when `webp` is
+/// not a WebP file this can rewrite (malformed, truncated, or too large for RIFF once the chunks are added).
+pub(super) fn with_chunks(webp: &[u8], chunks: Chunks<'_>) -> Option<Vec<u8>> {
     if webp.get(0..4)? != b"RIFF" || webp.get(8..12)? != b"WEBP" {
         return None;
     }
     let declared = u32::from_le_bytes(webp.get(4..8)?.try_into().ok()?) as usize;
     let mut rest = webp.get(12..8usize.checked_add(declared)?)?;
 
-    let mut chunks = Vec::new();
+    let mut existing = Vec::new();
     while !rest.is_empty() {
         let (kind, data, next) = riff_chunk(rest).ok()?;
-        chunks.push((kind, data));
+        existing.push((kind, data));
         rest = next;
     }
 
-    let (first, data) = *chunks.first()?;
+    let (first, data) = *existing.first()?;
     let vp8x = match &first {
         b"VP8X" => {
             let mut header: [u8; 10] = data.get(0..10)?.try_into().ok()?;
-            header[0] |= VP8X_ICC;
+            header[0] |= chunks.flags();
             header
         }
-        b"VP8 " => extended_header(vp8_size(data)?, false)?,
+        b"VP8 " => extended_header(vp8_size(data)?, false, chunks.flags())?,
         b"VP8L" => {
             let (size, alpha) = vp8l_size(data)?;
-            extended_header(size, alpha)?
+            extended_header(size, alpha, chunks.flags())?
         }
         _ => return None,
     };
 
-    let mut out = Vec::with_capacity(webp.len() + profile.len() + 32);
+    let replaced = |kind: &[u8; 4]| match kind {
+        b"VP8X" => true,
+        b"ICCP" => chunks.icc.is_some(),
+        b"EXIF" => chunks.exif.is_some(),
+        b"XMP " => chunks.xmp.is_some(),
+        _ => false,
+    };
+    let added = [chunks.icc, chunks.exif, chunks.xmp]
+        .iter()
+        .flatten()
+        .map(|data| data.len() + 9)
+        .sum::<usize>();
+
+    let mut out = Vec::with_capacity(webp.len() + added + 32);
     out.extend_from_slice(b"RIFF\0\0\0\0WEBP");
     push_chunk(&mut out, b"VP8X", &vp8x)?;
-    push_chunk(&mut out, b"ICCP", profile)?;
-    for (kind, data) in &chunks {
-        if kind != b"VP8X" && kind != b"ICCP" {
+    if let Some(profile) = chunks.icc {
+        push_chunk(&mut out, b"ICCP", profile)?;
+    }
+    for (kind, data) in &existing {
+        if !replaced(kind) {
             push_chunk(&mut out, kind, data)?;
         }
+    }
+    if let Some(exif) = chunks.exif {
+        push_chunk(&mut out, b"EXIF", exif)?;
+    }
+    if let Some(xmp) = chunks.xmp {
+        push_chunk(&mut out, b"XMP ", xmp)?;
     }
 
     let riff_size = u32::try_from(out.len() - 8).ok()?;
@@ -60,8 +109,8 @@ pub(super) fn with_iccp(webp: &[u8], profile: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// A `VP8X` payload for a still image of `(width, height)`, with the ICC flag and, if `alpha`, the alpha flag set.
-fn extended_header((width, height): (u32, u32), alpha: bool) -> Option<[u8; 10]> {
+/// A `VP8X` payload for a still image of `(width, height)`, with `flags` and, if `alpha`, the alpha flag set.
+fn extended_header((width, height): (u32, u32), alpha: bool, flags: u8) -> Option<[u8; 10]> {
     // The canvas is stored as one less than its size, in 24 bits.
     let (width, height) = (width.checked_sub(1)?, height.checked_sub(1)?);
     if width >= 1 << 24 || height >= 1 << 24 {
@@ -69,7 +118,7 @@ fn extended_header((width, height): (u32, u32), alpha: bool) -> Option<[u8; 10]>
     }
 
     let mut header = [0_u8; 10];
-    header[0] = VP8X_ICC | if alpha { VP8X_ALPHA } else { 0 };
+    header[0] = flags | if alpha { VP8X_ALPHA } else { 0 };
     header[4..7].copy_from_slice(&width.to_le_bytes()[..3]);
     header[7..10].copy_from_slice(&height.to_le_bytes()[..3]);
     Some(header)
