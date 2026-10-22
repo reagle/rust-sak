@@ -56,7 +56,7 @@ pub fn unzip(
 
         // Every field has to be read out before `entry` is borrowed mutably as the content stream, or the immutable
         // and mutable borrows overlap.
-        let name = entry.name().to_string();
+        let name = entry.name()?.into_owned();
         let size = entry.size();
         let mode = entry.unix_mode();
         let kind = classify(&entry, mode);
