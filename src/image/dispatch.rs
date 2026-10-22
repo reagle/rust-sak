@@ -7,6 +7,7 @@ use ::image::codecs::png::PngEncoder;
 use ::image::codecs::tiff::{TiffDecoder, TiffEncoder};
 use ::image::{DynamicImage, ImageDecoder, ImageEncoder, ImageReader};
 
+use super::blocks::{self, ToWrite};
 use super::container;
 use super::error::{ImageError, Result};
 use super::icc;
@@ -356,10 +357,11 @@ static AVIF_ENCODE: Mutex<()> = Mutex::new(());
 ///
 /// Every codec here except BMP, GIF and TIFF takes a plain [`Write`], so the encoded bytes go to the destination as
 /// they are produced rather than being accumulated first. The three that need `Write + Seek` are the only ones that
-/// buffer, into a `Cursor` of their own — which keeps that requirement from reaching the caller's sink. WebP also
-/// buffers, but only when there is a profile to embed: its chunks are rewritten after libwebp has finished.
+/// buffer, into a `Cursor` of their own — which keeps that requirement from reaching the caller's sink. JPEG, PNG and
+/// WebP also buffer, but only when there is something to splice into the finished file: EXIF, XMP or IPTC (and, for
+/// WebP, an ICC profile), whose segments or chunks are inserted once the codec has finished.
 ///
-/// Embedding never fails the encode. A profile the format cannot hold, or one too large for it, is left out and
+/// Embedding never fails the encode. A block the format cannot hold, or one too large for it, is left out and
 /// reported `false` in the returned [`Embedded`].
 pub(super) fn encode_into<W: Write>(
     image: &DynamicImage,
@@ -372,6 +374,7 @@ pub(super) fn encode_into<W: Write>(
     let image = converted.as_ref().unwrap_or(image);
 
     let profile = metadata.icc_profile.as_deref();
+    let blocks = ToWrite::of(metadata);
     let mut embedded = Embedded::default();
 
     match options {
@@ -398,14 +401,22 @@ pub(super) fn encode_into<W: Write>(
             writer.write_all(&seekable.into_inner())?;
         }
         EncodeOptions::Jpeg { quality } => {
-            let mut encoder = JpegEncoder::new_with_quality(writer, quality);
-            embedded.icc_profile = offer_profile(&mut encoder, profile, JPEG_MAX_ICC_PROFILE_LEN);
-            image.write_with_encoder(encoder)?;
+            let encode = |sink: &mut dyn Write| -> Result<bool> {
+                let mut encoder = JpegEncoder::new_with_quality(sink, quality);
+                let icc = offer_profile(&mut encoder, profile, JPEG_MAX_ICC_PROFILE_LEN);
+                image.write_with_encoder(encoder)?;
+                Ok(icc)
+            };
+            embedded.icc_profile = spliced(writer, ImageFormat::Jpeg, blocks, &mut embedded, encode)?;
         }
         EncodeOptions::Png { compression, filter } => {
-            let mut encoder = PngEncoder::new_with_quality(writer, compression.into(), filter.into());
-            embedded.icc_profile = offer_profile(&mut encoder, profile, usize::MAX);
-            image.write_with_encoder(encoder)?;
+            let encode = |sink: &mut dyn Write| -> Result<bool> {
+                let mut encoder = PngEncoder::new_with_quality(sink, compression.into(), filter.into());
+                let icc = offer_profile(&mut encoder, profile, usize::MAX);
+                image.write_with_encoder(encoder)?;
+                Ok(icc)
+            };
+            embedded.icc_profile = spliced(writer, ImageFormat::Png, blocks, &mut embedded, encode)?;
         }
         EncodeOptions::Avif {
             quality,
@@ -449,26 +460,62 @@ pub(super) fn encode_into<W: Write>(
                     .with_threads(threads)
             }
             let settings = (quality, quality_alpha, compression, lossless, threads);
-            match profile.filter(|profile| profile.len() <= MAX_ICC_PROFILE_LEN) {
+            let chunks = riff::Chunks {
+                icc: profile.filter(|profile| profile.len() <= MAX_ICC_PROFILE_LEN),
+                exif: blocks.exif,
+                xmp: blocks.xmp,
+            };
+            if chunks.is_empty() {
                 // Nothing to add, so nothing to rewrite: streamed exactly as before.
-                None => image.write_with_encoder(encoder(writer, settings))?,
-                Some(profile) => {
-                    let mut plain = Vec::new();
-                    image.write_with_encoder(encoder(&mut plain, settings))?;
-                    match riff::with_iccp(&plain, profile) {
-                        Some(tagged) => {
-                            writer.write_all(&tagged)?;
-                            embedded.icc_profile = true;
-                        }
-                        // The encoder's own output, written as it stands, rather than no file at all.
-                        None => writer.write_all(&plain)?,
+                image.write_with_encoder(encoder(writer, settings))?;
+            } else {
+                let mut plain = Vec::new();
+                image.write_with_encoder(encoder(&mut plain, settings))?;
+                match riff::with_chunks(&plain, chunks) {
+                    Some(tagged) => {
+                        writer.write_all(&tagged)?;
+                        embedded.icc_profile = chunks.icc.is_some();
+                        embedded.exif = chunks.exif.is_some();
+                        embedded.xmp = chunks.xmp.is_some();
                     }
+                    // The encoder's own output, written as it stands, rather than no file at all.
+                    None => writer.write_all(&plain)?,
                 }
             }
         }
     }
 
     Ok(embedded)
+}
+
+/// Encodes through `encode` straight into `writer` when there are no `blocks` to splice into `format`, or into a buffer
+/// they are spliced into before it is written; records in `embedded` which blocks were written, and passes on what
+/// `encode` answered (whether the codec took the ICC profile).
+///
+/// A splice that cannot walk the encoder's output — not expected, the output being this crate's own — writes that
+/// output as it stands and reports the blocks unwritten, rather than failing the encode.
+fn spliced<W: Write>(
+    writer: &mut W,
+    format: ImageFormat,
+    blocks: ToWrite<'_>,
+    embedded: &mut Embedded,
+    encode: impl FnOnce(&mut dyn Write) -> Result<bool>,
+) -> Result<bool> {
+    if blocks.is_empty() {
+        return encode(writer);
+    }
+    let mut plain = Vec::new();
+    let icc = encode(&mut plain)?;
+    match blocks::splice(&plain, format, blocks) {
+        Some((out, wrote)) => {
+            writer.write_all(&out)?;
+            embedded.exif = wrote.exif;
+            embedded.xmp = wrote.xmp;
+            embedded.iptc = wrote.iptc;
+        }
+        None => writer.write_all(&plain)?,
+    }
+    Ok(icc)
 }
 
 /// The largest profile the `image` crate's JPEG encoder splits across `APP2` segments: 255 segments of 65,519 bytes.
