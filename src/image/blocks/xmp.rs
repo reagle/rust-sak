@@ -30,12 +30,29 @@ pub(super) fn plausible(packet: &[u8]) -> bool {
 ///
 /// Replacing an emptied standard part is what makes a packet [`split`] for a JPEG come back with exactly the `rdf:RDF`
 /// contents it went out with, and a second round trip byte for byte the same as the first.
+///
+/// The namespaces the extended packet declares on its `x:xmpmeta` and `rdf:RDF` — which its descriptions may rely on —
+/// are declared on the standard packet's `rdf:RDF` too, where it does not already bind them; a prefix the two bind to
+/// different namespaces, or a default namespace, makes the join refuse rather than change what a name means.
 pub(super) fn join(standard: &[u8], guid: &str, extended: &[u8]) -> Option<Vec<u8>> {
     let standard = std::str::from_utf8(standard).ok()?;
     let extended = std::str::from_utf8(extended).ok()?;
 
-    let (_, body) = rdf_body(extended)?;
+    let (body_at, body) = rdf_body(extended)?;
+    let carried = declarations(&extended[..body_at])?;
     let without = without_reference(standard, guid)?;
+    let (start, _) = rdf_body(&without)?;
+    let present = declarations(&without[..start])?;
+    let mut added = String::new();
+    for (prefix, quote, uri) in carried {
+        match present.iter().find(|(bound, ..)| *bound == prefix) {
+            Some((_, _, bound_uri)) if *bound_uri == uri => {}
+            Some(_) => return None,
+            None => added.push_str(&format!(" xmlns:{prefix}={quote}{uri}{quote}")),
+        }
+    }
+    // Inside the `rdf:RDF` start tag, before its `>`.
+    let without = format!("{}{}{}", &without[..start - 1], added, &without[start - 1..]);
     let (start, remaining) = rdf_body(&without)?;
     let (from, to) = if remaining.trim().is_empty() {
         (start, start + remaining.len())
@@ -48,6 +65,32 @@ pub(super) fn join(standard: &[u8], guid: &str, extended: &[u8]) -> Option<Vec<u
     joined.push_str(body);
     joined.push_str(&without[to..]);
     (joined.len() <= MAX_BLOCK_LEN).then(|| joined.into_bytes())
+}
+
+/// The `xmlns:prefix` declarations in `tags` — the start tags in front of an `rdf:RDF`'s contents — as `(prefix, quote,
+/// value as written)`; `None` if one is not well-formed or a default namespace (`xmlns=`) is declared.
+fn declarations(tags: &str) -> Option<Vec<(&str, char, &str)>> {
+    let mut found = Vec::new();
+    let mut rest = tags;
+    while let Some(at) = rest.find("xmlns") {
+        let after = &rest[at + "xmlns".len()..];
+        let Some(named) = after.strip_prefix(':') else {
+            // `xmlns=`, a default namespace: moving descriptions under it would change their unprefixed names.
+            if after.trim_start().starts_with('=') {
+                return None;
+            }
+            rest = after;
+            continue;
+        };
+        let name_end = named.find(|c: char| c == '=' || c.is_whitespace())?;
+        let prefix = &named[..name_end];
+        let value = named[name_end..].trim_start().strip_prefix('=')?.trim_start();
+        let quote = value.chars().next().filter(|quote| matches!(quote, '"' | '\''))?;
+        let close = value[1..].find(quote)?;
+        found.push((prefix, quote, &value[1..1 + close]));
+        rest = &value[1 + close + 1..];
+    }
+    Some(found)
 }
 
 /// The GUID the standard packet's `xmpNote:HasExtendedXMP` names, element or attribute: the 32 hex digits that follow
@@ -246,6 +289,34 @@ mod tests {
         // And a second round trip changes nothing at all.
         let (main, guid, extended) = split(&joined);
         assert_eq!(join(&main, &guid, &extended).unwrap(), joined);
+    }
+
+    #[test]
+    fn namespaces_the_extended_packet_declares_outside_its_descriptions_come_along() {
+        // As the review's x-extns repro: `dc` is declared only on the extended packet's `x:xmpmeta`.
+        let extended = "<x:xmpmeta xmlns:x='adobe:ns:meta/' xmlns:dc='http://purl.org/dc/elements/1.1/'>\
+            <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>\
+            <rdf:Description rdf:about=''><dc:description>long</dc:description></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let main = standard(&format!(
+            "<rdf:Description rdf:about='' xmlns:xmpNote='http://ns.adobe.com/xmp/note/'>\
+             <xmpNote:HasExtendedXMP>{GUID}</xmpNote:HasExtendedXMP></rdf:Description>"
+        ));
+        let joined = String::from_utf8(join(main.as_bytes(), GUID, extended.as_bytes()).unwrap()).unwrap();
+        let rdf_tag = &joined[joined.find("<rdf:RDF").unwrap()..];
+        let rdf_tag = &rdf_tag[..rdf_tag.find('>').unwrap()];
+        assert!(
+            rdf_tag.contains("xmlns:dc='http://purl.org/dc/elements/1.1/'"),
+            "{joined}"
+        );
+        // Declared once, and the joined packet is well-formed XML with every prefix bound.
+        assert_eq!(joined.matches("xmlns:dc=").count(), 1);
+
+        // A prefix bound to another namespace, or a default namespace, refuses the join.
+        let clash = extended.replace("purl.org/dc/elements/1.1/", "example.com/other/");
+        let main_with_dc = main.replace("<rdf:RDF ", "<rdf:RDF xmlns:dc='http://purl.org/dc/elements/1.1/' ");
+        assert_eq!(join(main_with_dc.as_bytes(), GUID, clash.as_bytes()), None);
+        let default = extended.replace("xmlns:dc=", "xmlns=");
+        assert_eq!(join(main.as_bytes(), GUID, default.as_bytes()), None);
     }
 
     #[test]
