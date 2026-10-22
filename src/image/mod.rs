@@ -15,8 +15,12 @@
 //! - [`rotate`] — turn an image by any angle onto a canvas expanded to contain it, clockwise for a positive
 //!   angle, with the uncovered area left transparent.
 //! - [`fit`] — scale an image down so its longer edge equals a bound, keeping the aspect ratio and never enlarging.
+//! - [`icc_profile_bytes`] / [`icc_profile_file`] — read the exact bytes of an embedded ICC colour profile without
+//!   decoding the pixels, and [`icc_profile_description`] to name one.
 //! - [`encode_file`] — encode and save to a path, format chosen from its extension.
 //! - [`encode_writer`] — encode and write to any [`Write`](std::io::Write) sink with an explicit [`ImageFormat`].
+//! - [`encode_file_with`] / [`encode_writer_with`] — the same, embedding the [`Metadata`] given (an ICC profile) where
+//!   the format can hold it, and reporting what was written as [`Embedded`].
 //!
 //! Lossy/codec-specific settings are supplied per format via [`EncodeOptions`]; pass `None` to use sensible defaults.
 //!
@@ -73,30 +77,43 @@ mod decode_bytes_with_format;
 mod decode_file;
 mod dispatch;
 mod encode_file;
+mod encode_file_with;
 mod encode_writer;
+mod encode_writer_with;
 mod error;
 mod fit;
 mod format;
 mod format_from_bytes;
 mod icc;
+mod icc_profile_bytes;
+mod icc_profile_description;
+mod icc_profile_file;
 mod info;
+mod metadata;
 mod options;
 mod probe_bytes;
 mod probe_file;
 #[cfg(feature = "image-raw")]
 mod raw;
+mod riff;
 mod rotate;
 
 pub use decode_bytes::decode_bytes;
 pub use decode_bytes_with_format::decode_bytes_with_format;
 pub use decode_file::decode_file;
 pub use encode_file::encode_file;
+pub use encode_file_with::encode_file_with;
 pub use encode_writer::encode_writer;
+pub use encode_writer_with::encode_writer_with;
 pub use error::{ImageError, Result};
 pub use fit::fit;
 pub use format::ImageFormat;
 pub use format_from_bytes::format_from_bytes;
+pub use icc_profile_bytes::icc_profile_bytes;
+pub use icc_profile_description::icc_profile_description;
+pub use icc_profile_file::icc_profile_file;
 pub use info::ImageInfo;
+pub use metadata::{Embedded, Metadata};
 pub use options::{Chroma, EncodeOptions, PngCompression, PngFilter, Preset};
 pub use probe_bytes::probe_bytes;
 pub use probe_file::probe_file;

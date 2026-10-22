@@ -13,7 +13,7 @@ use super::info::ImageInfo;
 /// Those three codecs probe a byte slice rather than a stream, so some bound has to be chosen. A header — including
 /// the boxes an ISO-BMFF container puts in front of one — sits comfortably inside this; the rare file that needs more
 /// is handled by re-reading it whole rather than by guessing a larger number here.
-const HEADER_PREFIX: u64 = 64 * 1024;
+pub(super) const HEADER_PREFIX: u64 = 64 * 1024;
 
 /// The most a probe will ever read, when the prefix was not enough.
 ///
@@ -86,7 +86,7 @@ pub fn probe_file(path: impl AsRef<Path>) -> Result<ImageInfo> {
 }
 
 /// Appends the rest of `file` to `bytes`, stopping once `bytes` holds [`MAX_PROBE_BYTES`].
-fn read_rest_bounded(file: &mut File, bytes: &mut Vec<u8>) -> std::io::Result<()> {
+pub(super) fn read_rest_bounded(file: &mut File, bytes: &mut Vec<u8>) -> std::io::Result<()> {
     let room = MAX_PROBE_BYTES.saturating_sub(bytes.len() as u64);
     file.take(room).read_to_end(bytes)?;
 

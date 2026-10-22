@@ -22,9 +22,9 @@ image = { version = "0.25", default-features = false }
 ```rust
 use rust_sak::image::{
     decode_file, decode_bytes, decode_bytes_with_format, format_from_bytes,
-    probe_file, probe_bytes,
-    encode_file, encode_writer,
-    ImageFormat, ImageInfo, EncodeOptions, PngCompression, PngFilter, Preset, Chroma,
+    probe_file, probe_bytes, icc_profile_bytes, icc_profile_file, icc_profile_description,
+    encode_file, encode_writer, encode_file_with, encode_writer_with,
+    ImageFormat, ImageInfo, EncodeOptions, Metadata, Embedded, PngCompression, PngFilter, Preset, Chroma,
     ImageError, Result,
 };
 ```
@@ -51,6 +51,9 @@ are pure pixel arithmetic with nothing to fail, so they return their picture dir
 | `format_from_bytes` | `fn format_from_bytes(bytes: &[u8]) -> Result<ImageFormat>`  | Sniffs the format from magic bytes **without decoding pixels**. `UnrecognizedFormat` if no match.                         |
 | `probe_bytes`       | `fn probe_bytes(bytes: &[u8]) -> Result<ImageInfo>`          | Reads metadata (dimensions, color type, bit depth, color profile) from the header; format guessed from **magic bytes**. No pixel decode. |
 | `probe_file`        | `fn probe_file(path: impl AsRef<Path>) -> Result<ImageInfo>` | Same, for a file; format from the **extension**. Reads the file bytes but never decodes pixels.                           |
+| `icc_profile_bytes` | `fn icc_profile_bytes(bytes: &[u8]) -> Result<Option<Vec<u8>>>` | The **exact bytes** of the embedded ICC colour profile, from the header; format from **magic bytes**. No pixel decode. See [Colour profiles](#colour-profiles). |
+| `icc_profile_description` | `fn icc_profile_description(profile: &[u8]) -> Option<String>` | A profile's own description (`Display P3`), as `ImageInfo::color_profile` reports it. |
+| `icc_profile_file`  | `fn icc_profile_file(path: impl AsRef<Path>) -> Result<Option<Vec<u8>>>` | Same, for a file; format from the **extension**. Reads only the header for native formats, a 64 KiB prefix (or the whole file, if the profile lies further in) for the containers. |
 
 ### Transforming
 
@@ -90,6 +93,8 @@ the pieces that were missing.
 |-----------------|--------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------|
 | `encode_file`   | `fn encode_file(image: &DynamicImage, path: impl AsRef<Path>, options: Option<EncodeOptions>) -> Result<()>`                         | Encodes and writes to `path`; format chosen from the **extension**. |
 | `encode_writer` | `fn encode_writer(image: &DynamicImage, writer: &mut impl Write, format: ImageFormat, options: Option<EncodeOptions>) -> Result<()>` | Encodes to any `Write` sink with an **explicit** format.            |
+| `encode_file_with`   | `fn encode_file_with(image: &DynamicImage, path: impl AsRef<Path>, options: Option<EncodeOptions>, metadata: &Metadata) -> Result<Embedded>` | `encode_file`, embedding `metadata` where the format can hold it; reports what was written. |
+| `encode_writer_with` | `fn encode_writer_with(image: &DynamicImage, writer: &mut impl Write, format: ImageFormat, options: Option<EncodeOptions>, metadata: &Metadata) -> Result<Embedded>` | `encode_writer`, embedding `metadata` where the format can hold it; reports what was written. |
 
 For both encoders, pass `options: None` to use the format's defaults. A `Some(_)` whose variant targets a **different** format than the destination yields `ImageError::FormatMismatch`.
 
@@ -104,6 +109,43 @@ The conversion loses as little as the destination forces:
 - **Grayscale** is expanded to colour only where the format has no grayscale representation (`gif`).
 
 A picture the target already accepts is **not** converted — it is handed to the codec as it stands, so a lossless format writes it byte for byte. This matters most for RAW, which always develops to 16-bit: a `.nef` exported as PNG or TIFF keeps its depth, and the same file exported as WebP or JPEG comes back 8-bit.
+
+### Colour profiles
+
+`icc_profile_bytes` / `icc_profile_file` read an embedded ICC profile **byte for byte**, and `encode_*_with` write one back, so a program that decodes a photograph, changes its pixels and re-encodes it can keep the profile that says what those pixel values mean. Nothing is converted: the profile is a label carried beside the pixels, and no colour-management engine is involved.
+
+| Format | Read from | Written as |
+|---|---|---|
+| JPEG | `APP2` `ICC_PROFILE` segments, reassembled | the same, split across segments above 64 KiB (at most 255 × 65,519 bytes) |
+| PNG | `iCCP` | `iCCP` |
+| TIFF | tag 34675 | tag 34675 |
+| WebP | `ICCP` | `ICCP`, with a `VP8X` header added to a simple file or its flag set on an extended one |
+| AVIF, HEIF | the primary item's `colr` box of type `prof`/`rICC` (an `nclx`-only file has none) | not written yet |
+| BMP, GIF | none | not written |
+
+- **`Metadata`** is what an encode embeds: `icc_profile: Option<Vec<u8>>`. It is `#[non_exhaustive]` so further blocks can join it — build it with `Metadata::default()` and assign the fields. `Metadata::default()` writes exactly what `encode_file` / `encode_writer` write; those two are wrappers that pass it.
+- **`Embedded`** is what was actually written, one `bool` per `Metadata` field. A format that cannot hold a block, or a block too large for it, reports `false` — **the encode itself never fails because of metadata**.
+- **Untrusted input is bounded.** A profile under the 128-byte ICC header, without the `acsp` signature, or over 16 MiB reads as `None`; truncated or malformed containers read as `None` rather than an error, and nothing panics.
+
+```rust
+use image::{DynamicImage, RgbImage};
+use rust_sak::image::{ImageFormat, Metadata, encode_writer, encode_writer_with, icc_profile_bytes};
+
+// Pretend this JPEG came from a camera with a Display P3 profile.
+let mut source = Vec::new();
+encode_writer(&DynamicImage::ImageRgb8(RgbImage::new(4, 4)), &mut source, ImageFormat::Jpeg, None).unwrap();
+
+let mut metadata = Metadata::default();
+metadata.icc_profile = icc_profile_bytes(&source).unwrap(); // `None` here: this one has no profile
+
+let mut out = Vec::new();
+let embedded = encode_writer_with(
+    &DynamicImage::ImageRgb8(RgbImage::new(4, 4)), &mut out, ImageFormat::Png, None, &metadata,
+).unwrap();
+assert!(!embedded.icc_profile);
+```
+
+> **Added after 26.10.8:** `icc_profile_bytes`, `icc_profile_file`, `icc_profile_description`, `Metadata`, `Embedded`, `encode_file_with` and `encode_writer_with`. TIFF now encodes through `TiffEncoder` rather than `DynamicImage::write_to` (the bytes are unchanged), and `probe_bytes`/`probe_file` now report a TIFF's embedded profile name on small images too, where the `image` crate's reader limits used to hide it.
 
 ## RAW decoding (`image-raw`)
 

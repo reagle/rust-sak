@@ -1,12 +1,9 @@
-use std::fs::File;
-use std::io::BufWriter;
 use std::path::Path;
 
 use ::image::DynamicImage;
 
-use super::dispatch::{encode_into, resolve_options};
-use super::error::{ImageError, Result};
-use super::{EncodeOptions, ImageFormat};
+use super::error::Result;
+use super::{EncodeOptions, Metadata, encode_file_with};
 
 /// Encodes `image` and writes it to `path`, selecting the format from the file extension.
 ///
@@ -17,20 +14,12 @@ use super::{EncodeOptions, ImageFormat};
 ///
 /// # Errors
 ///
-/// Returns [`ImageError::UnknownExtension`] if the path has no recognized image extension,
-/// [`ImageError::FormatMismatch`] if `options` is for a different format than the extension names,
-/// [`ImageError::Io`](super::ImageError::Io) if the file cannot be written, and the codec's own error if encoding
-/// fails.
+/// Returns [`ImageError::UnknownExtension`](super::ImageError::UnknownExtension) if the path has no recognized image
+/// extension, [`ImageError::FormatMismatch`](super::ImageError::FormatMismatch) if `options` is for a different format
+/// than the extension names, [`ImageError::Io`](super::ImageError::Io) if the file cannot be written, and the codec's
+/// own error if encoding fails.
+///
+/// Embeds nothing beside the pixels; [`encode_file_with`] is the same encode with a [`Metadata`] to embed.
 pub fn encode_file(image: &DynamicImage, path: impl AsRef<Path>, options: Option<EncodeOptions>) -> Result<()> {
-    let path = path.as_ref();
-    let format = ImageFormat::from_path(path).ok_or(ImageError::UnknownExtension)?;
-    let options = resolve_options(format, options)?;
-
-    let mut writer = BufWriter::new(File::create(path)?);
-    encode_into(image, options, &mut writer)?;
-
-    // `BufWriter` swallows a write failure on drop, which would turn a full disk into a silently truncated image.
-    std::io::Write::flush(&mut writer)?;
-
-    Ok(())
+    encode_file_with(image, path, options, &Metadata::default()).map(drop)
 }

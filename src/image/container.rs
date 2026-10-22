@@ -1,5 +1,6 @@
 //! Finds the color profile the `avif`/`heif`/`webp` containers declare, by walking their boxes and chunks rather than
-//! asking the codecs, none of which report it.
+//! asking the codecs, none of which report it. One walk answers both the profile's name (for `probe`) and its bytes
+//! (for `icc_profile_bytes`), so the two cannot disagree.
 //!
 //! - **WebP:** the RIFF `ICCP` chunk, which an extended (`VP8X`) file places ahead of the image data.
 //! - **AVIF and HEIF:** the primary item's `colr` property, reached from `meta` through `pitm`, `iprp`/`ipco` and
@@ -14,13 +15,29 @@ pub(super) struct Truncated;
 
 /// A RIFF chunk or an ISO-BMFF box split off the front of some bytes: its four-character type, its contents, and the
 /// bytes that follow it.
-type Split<'a> = ([u8; 4], &'a [u8], &'a [u8]);
+pub(super) type Split<'a> = ([u8; 4], &'a [u8], &'a [u8]);
 
-/// Returns the name of the color profile the container in `bytes` declares, `Ok(None)` when it declares none (or one
-/// with no name), or [`Truncated`] when `bytes` ends before that could be decided.
+/// How a container describes its colour: an embedded ICC profile, or CICP codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Declared<'a> {
+    /// The exact bytes of an embedded ICC profile (WebP `ICCP`, ISO-BMFF `colr` of type `prof`/`rICC`).
+    Icc(&'a [u8]),
+    /// An ISO-BMFF `colr` of type `nclx`: ITU-T H.273 colour primaries and transfer characteristics.
+    Coded {
+        /// The colour primaries code.
+        primaries: u16,
+        /// The transfer characteristics code.
+        transfer: u16,
+    },
+}
+
+/// Returns what the container in `bytes` declares about its colour, `Ok(None)` when it declares nothing, or
+/// [`Truncated`] when `bytes` ends before that could be decided.
 ///
-/// Native formats are not containers this reads; they give `Ok(None)`.
-pub(super) fn color_profile(bytes: &[u8], format: ImageFormat) -> Result<Option<String>, Truncated> {
+/// The one walk both [`color_profile`] and [`icc_profile`] are answered from, so the name a probe reports and the bytes
+/// a caller embeds can never come from two different boxes. Native formats are not containers this reads; they give
+/// `Ok(None)`.
+pub(super) fn declared(bytes: &[u8], format: ImageFormat) -> Result<Option<Declared<'_>>, Truncated> {
     match format {
         ImageFormat::WebP => webp(bytes),
         ImageFormat::Avif | ImageFormat::Heif => isobmff(bytes),
@@ -28,12 +45,32 @@ pub(super) fn color_profile(bytes: &[u8], format: ImageFormat) -> Result<Option<
     }
 }
 
+/// Returns the name of the color profile the container in `bytes` declares, `Ok(None)` when it declares none (or one
+/// with no name), or [`Truncated`] when `bytes` ends before that could be decided.
+///
+/// An embedded ICC profile is named by its own description; CICP codes are named from a fixed table.
+pub(super) fn color_profile(bytes: &[u8], format: ImageFormat) -> Result<Option<String>, Truncated> {
+    Ok(declared(bytes, format)?.and_then(|declared| match declared {
+        Declared::Icc(profile) => icc::description(profile),
+        Declared::Coded { primaries, transfer } => nclx_name(primaries, transfer).map(str::to_owned),
+    }))
+}
+
+/// Returns the exact bytes of the ICC profile the container in `bytes` embeds, `Ok(None)` when it embeds none (a
+/// coded-only `nclx` description included), or [`Truncated`] when `bytes` ends before that could be decided.
+pub(super) fn icc_profile(bytes: &[u8], format: ImageFormat) -> Result<Option<&[u8]>, Truncated> {
+    Ok(declared(bytes, format)?.and_then(|declared| match declared {
+        Declared::Icc(profile) => Some(profile),
+        Declared::Coded { .. } => None,
+    }))
+}
+
 // ── WebP ───────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /// The `VP8X` flag that says an `ICCP` chunk follows.
 const VP8X_ICC: u8 = 0x20;
 
-fn webp(bytes: &[u8]) -> Result<Option<String>, Truncated> {
+fn webp(bytes: &[u8]) -> Result<Option<Declared<'_>>, Truncated> {
     if bytes.len() < 12 {
         return Err(Truncated);
     }
@@ -52,7 +89,7 @@ fn webp(bytes: &[u8]) -> Result<Option<String>, Truncated> {
                     return Ok(None);
                 }
             }
-            b"ICCP" => return Ok(icc::description(data)),
+            b"ICCP" => return Ok(Some(Declared::Icc(data))),
             // The profile must come before the image data; reaching that means it is not there.
             _ => return Ok(None),
         }
@@ -63,7 +100,7 @@ fn webp(bytes: &[u8]) -> Result<Option<String>, Truncated> {
 
 /// Splits the RIFF chunk at the front of `bytes` into its four-character code, its data, and what follows it (chunks
 /// are padded to an even length).
-fn riff_chunk(bytes: &[u8]) -> Result<Split<'_>, Truncated> {
+pub(super) fn riff_chunk(bytes: &[u8]) -> Result<Split<'_>, Truncated> {
     let header = bytes.get(0..8).ok_or(Truncated)?;
     let kind: [u8; 4] = header[0..4].try_into().expect("four bytes");
     let size = u32::from_le_bytes(header[4..8].try_into().expect("four bytes")) as usize;
@@ -77,7 +114,7 @@ fn riff_chunk(bytes: &[u8]) -> Result<Split<'_>, Truncated> {
 
 // ── AVIF and HEIF ──────────────────────────────────────────────────────────────────────────────────────────────
 
-fn isobmff(bytes: &[u8]) -> Result<Option<String>, Truncated> {
+fn isobmff(bytes: &[u8]) -> Result<Option<Declared<'_>>, Truncated> {
     // Top-level boxes are walked until `meta`. Running out first is truncation: the `meta` box may sit after `mdat`.
     let mut rest = bytes;
     let meta = loop {
@@ -161,18 +198,21 @@ fn associations(ipma: &[u8], item: u32) -> Option<Vec<usize>> {
     Some(Vec::new())
 }
 
-/// The name for a set of `colr` bodies: an embedded ICC profile's description when there is a profile, otherwise the
-/// table name of a coded color description.
-fn profile_from_colrs(colrs: &[&[u8]]) -> Option<String> {
+/// What a set of `colr` bodies declares: an embedded ICC profile when there is one, otherwise a coded color
+/// description.
+fn profile_from_colrs<'a>(colrs: &[&'a [u8]]) -> Option<Declared<'a>> {
     let icc = colrs
         .iter()
         .find(|body| matches!(body.get(0..4), Some(b"prof" | b"rICC")));
     if let Some(body) = icc {
-        return icc::description(&body[4..]);
+        return Some(Declared::Icc(&body[4..]));
     }
 
     let nclx = colrs.iter().find(|body| body.get(0..4) == Some(b"nclx"))?;
-    nclx_name(read_u16(nclx, 4)?, read_u16(nclx, 6)?).map(str::to_owned)
+    Some(Declared::Coded {
+        primaries: read_u16(nclx, 4)?,
+        transfer: read_u16(nclx, 6)?,
+    })
 }
 
 /// Names a CICP color description (ITU-T H.273 primaries and transfer characteristics). Anything outside the table
