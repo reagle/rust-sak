@@ -80,34 +80,101 @@ pub(in crate::image) fn has_gain_map(bytes: &[u8]) -> bool {
 }
 
 /// The gain-map image the MP Index `data` locates in `bytes`, the index's TIFF header being at `tiff_at` in it: the
-/// first of the secondary entries of type Gain Map; failing that, when the primary `declared` a gain map (an Android
-/// file whose secondary entry has type 0), the first secondary entry.
+/// first of the secondary entries of type Gain Map; failing that, when the primary `declared` a gain map, the first
+/// secondary entry if its type is 0 (an Android file).
 ///
-/// Located by the entry's offset and size alone — never by the primary's recorded size, which an editor may have left
-/// stale — and then checked: it must lie inside `bytes` after the index, start with `SOI`, hold an `EOI` (where the
-/// image is cut, dropping any padding after it), and be no larger than [`MAX_GAIN_MAP_LEN`]. Otherwise there is none.
+/// Located by the entry's offset and size — never by the primary's recorded size, which an editor may have left stale —
+/// and then checked: it must lie inside `bytes` after the index, start with `SOI`, hold an `EOI` (where the image is
+/// cut, dropping any padding after it), and be no larger than [`MAX_GAIN_MAP_LEN`]. Where the offset is stale too (an
+/// editor that grew the primary after its index, as ExifTool does when it adds a `COM`, moves the gain map without
+/// updating it), the first secondary entry is looked for where MPF puts it, straight after the primary's `EOI`, and
+/// taken to its own `EOI` (at most [`MAX_GAIN_MAP_LEN`]); `libultrahdr` and Apple's ImageIO read such a file too.
+/// Otherwise there is none.
 fn gain_map_image<'a>(bytes: &'a [u8], tiff_at: usize, data: &[u8], declared: bool) -> Option<&'a [u8]> {
     let mut secondary = mpf::entries(data).skip(1).take(SECONDARY_ENTRIES);
     let first = secondary.next();
-    let entry = first
+    let (index, entry) = first
         .into_iter()
         .chain(secondary)
-        .find(|entry| entry.is_gain_map())
-        .or(first.filter(|_| declared))?;
+        .enumerate()
+        .find(|(_, entry)| entry.is_gain_map())
+        .or(first
+            .filter(|entry| declared && entry.is_untyped())
+            .map(|entry| (0, entry)))?;
 
-    let size = usize::try_from(entry.size).ok()?;
-    let start = tiff_at.checked_add(usize::try_from(entry.offset).ok()?)?;
+    let size = usize::try_from(entry.size).ok()?.min(MAX_GAIN_MAP_LEN);
     // After the index itself, which is after `SOI`: an offset of zero names the primary.
     let index_end = tiff_at.checked_add(data.len() - mpf::HEADER.len())?;
-    if start < index_end || size > MAX_GAIN_MAP_LEN {
+    let at = |start: usize| -> Option<&'a [u8]> {
+        if start < index_end || start >= bytes.len() {
+            return None;
+        }
+        let image = &bytes[start..start.saturating_add(size).min(bytes.len())];
+        if !image.starts_with(&[0xFF, SOI, 0xFF]) {
+            return None;
+        }
+        let end = image.windows(2).rposition(|pair| pair == [0xFF, EOI])?;
+        Some(&image[..end + 2])
+    };
+
+    let recorded = usize::try_from(entry.offset)
+        .ok()
+        .and_then(|offset| tiff_at.checked_add(offset));
+    let exact = recorded.filter(|&start| start.checked_add(size).is_some_and(|end| end <= bytes.len()));
+    exact.and_then(at).or_else(|| {
+        // Only the first secondary image follows the primary directly. Its recorded size is no more to be trusted than
+        // its offset, so it is walked to its own `EOI`.
+        if index != 0 {
+            return None;
+        }
+        let start = primary_end(bytes).filter(|&start| start >= index_end)?;
+        let rest = &bytes[start..bytes.len().min(start.saturating_add(MAX_GAIN_MAP_LEN))];
+        Some(&rest[..primary_end(rest)?])
+    })
+}
+
+/// Where the first image of `bytes` ends: just past its `EOI`, found by walking its segments and skipping each scan's
+/// entropy-coded data (where a `0xFF` is followed by a stuffed `0x00` or is a restart marker). Linear in the file and
+/// bounded by it; `None` for a file that is not a complete JPEG.
+fn primary_end(bytes: &[u8]) -> Option<usize> {
+    if !bytes.starts_with(&[0xFF, SOI]) {
         return None;
     }
-    let image = bytes.get(start..start.checked_add(size)?)?;
-    if !image.starts_with(&[0xFF, SOI, 0xFF]) {
-        return None;
+    let mut at = 2;
+    loop {
+        if *bytes.get(at)? != 0xFF {
+            return None;
+        }
+        // Any number of 0xFF fill bytes may precede a marker.
+        while *bytes.get(at + 1)? == 0xFF {
+            at += 1;
+        }
+        let marker = bytes[at + 1];
+        at += 2;
+        match marker {
+            EOI => return Some(at),
+            0x01 | 0xD0..=0xD7 => continue,
+            _ => {}
+        }
+        let length = usize::from(be_u16(bytes, at)?);
+        if length < 2 {
+            return None;
+        }
+        at = at.checked_add(length)?;
+        if marker == SOS {
+            // The scan's entropy-coded data runs to the next marker that is neither a stuffed byte nor a restart.
+            loop {
+                let ff = at + bytes.get(at..)?.iter().position(|&byte| byte == 0xFF)?;
+                match *bytes.get(ff + 1)? {
+                    0x00 | 0xD0..=0xD7 => at = ff + 2,
+                    _ => {
+                        at = ff;
+                        break;
+                    }
+                }
+            }
+        }
     }
-    let end = image.windows(2).rposition(|pair| pair == [0xFF, EOI])?;
-    Some(&image[..end + 2])
 }
 
 /// Reads a JPEG's EXIF, XMP and IPTC, its ISO 21496-1 payload, and its gain-map image.

@@ -32,6 +32,11 @@ impl Entry {
     pub(super) fn is_gain_map(self) -> bool {
         self.attribute & TYPE_MASK == TYPE_GAIN_MAP
     }
+
+    /// Whether the entry's type is 0, undefined: how Android's Ultra HDR v1 files mark their gain map.
+    pub(super) fn is_untyped(self) -> bool {
+        self.attribute & TYPE_MASK == 0
+    }
 }
 
 /// The MP Entries of the `APP2` segment `data`, in order; nothing if it is not an MP Index or cannot be walked. Lazy,
