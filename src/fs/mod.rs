@@ -2,8 +2,8 @@
 //!
 //! Two groups of things live here. The first is the small filesystem chores an application repeats everywhere:
 //! [`file_exists`], temporary files and directories ([`mk_temp_file`], [`mk_temp_dir`]), per-application
-//! configuration paths ([`user_config_dir`], [`mk_user_config_file`]), directory listing ([`list_path`]), filtered
-//! copying ([`copy_files`], [`move_files`]) and moving a file to the platform's Trash ([`move_to_trash`]) and back
+//! configuration and documents paths ([`user_config_dir`], [`mk_user_config_file`], [`user_documents_dir`]),
+//! directory listing ([`list_path`]), filtered copying ([`copy_files`], [`move_files`]) and moving a file to the platform's Trash ([`move_to_trash`]) and back
 //! ([`restore_from_trash`]). All of it is **synchronous** — plain [`std::fs`], no async runtime.
 //!
 //! The second is an archive extractor for ZIP, 7z and TAR.XZ ([`extract`], [`extract_as`] when the
@@ -57,6 +57,7 @@ mod mk_temp_dir;
 mod mk_temp_file;
 mod mk_user_config_dir;
 mod mk_user_config_file;
+mod mk_user_documents_dir;
 mod move_files;
 mod move_to_trash;
 mod restore_from_trash;
@@ -67,6 +68,8 @@ mod un7zip;
 mod untar_xz;
 mod unzip;
 mod user_config_dir;
+mod user_dir;
+mod user_documents_dir;
 
 pub use archive_format::ArchiveFormat;
 pub use copy_files::copy_files;
@@ -81,6 +84,7 @@ pub use mk_temp_dir::{mk_temp_dir, mk_temp_dir_in};
 pub use mk_temp_file::{mk_temp_file, mk_temp_file_in};
 pub use mk_user_config_dir::mk_user_config_dir;
 pub use mk_user_config_file::mk_user_config_file;
+pub use mk_user_documents_dir::mk_user_documents_dir;
 pub use move_files::move_files;
 pub use move_to_trash::move_to_trash;
 pub use restore_from_trash::restore_from_trash;
@@ -90,6 +94,7 @@ pub use un7zip::un7zip;
 pub use untar_xz::untar_xz;
 pub use unzip::unzip;
 pub use user_config_dir::user_config_dir;
+pub use user_documents_dir::user_documents_dir;
 
 #[cfg(test)]
 mod tests;

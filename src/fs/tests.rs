@@ -5,11 +5,10 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use super::extract::{Budget, EntryKind, permissions};
-use super::mk_user_config_dir::mk_config_dir_at;
 use super::mk_user_config_file::mk_config_file_at;
 use super::safe_path::{validate_entry_name, validate_symlink_target};
 use super::un7zip::classify;
-use super::user_config_dir::config_path;
+use super::user_dir::{mk_user_dir_at, user_path};
 use super::*;
 
 /// Splits a validated entry name, panicking on rejection — for cases where acceptance is the precondition, not the
@@ -327,80 +326,84 @@ fn validate_symlink_target_reports_both_halves() {
     assert_eq!(target, "../../outside");
 }
 
-// --- user config tests ---
+// --- user folder tests ---
 
 #[test]
-fn config_path_joins_the_name_and_sub_path() {
+fn user_path_joins_the_name_and_sub_path() {
     let root = TempDir::new().unwrap();
 
-    let path = config_path(root.path(), "my-app", Path::new("themes")).unwrap();
+    let path = user_path(root.path(), "my-app", Path::new("themes")).unwrap();
     assert_eq!(path, root.path().join("my-app").join("themes"));
+    assert!(
+        !root.path().join("my-app").exists(),
+        "computing the path must create nothing"
+    );
 }
 
 #[test]
-fn config_path_returns_the_app_directory_for_an_empty_sub_path() {
+fn user_path_returns_the_app_directory_for_an_empty_sub_path() {
     let root = TempDir::new().unwrap();
 
-    let path = config_path(root.path(), "my-app", Path::new("")).unwrap();
+    let path = user_path(root.path(), "my-app", Path::new("")).unwrap();
     assert_eq!(path, root.path().join("my-app"));
 }
 
 #[test]
-fn config_path_accepts_a_nested_sub_path() {
+fn user_path_accepts_a_nested_sub_path() {
     let root = TempDir::new().unwrap();
 
-    let path = config_path(root.path(), "my-app", Path::new("themes/dark.toml")).unwrap();
+    let path = user_path(root.path(), "my-app", Path::new("themes/dark.toml")).unwrap();
     assert_eq!(path, root.path().join("my-app").join("themes").join("dark.toml"));
 }
 
 #[test]
-fn config_path_rejects_an_empty_name() {
+fn user_path_rejects_an_empty_name() {
     let root = TempDir::new().unwrap();
 
     assert!(matches!(
-        config_path(root.path(), "", Path::new("")),
+        user_path(root.path(), "", Path::new("")),
         Err(FsError::EmptyName)
     ));
 }
 
 #[test]
-fn config_path_rejects_a_name_that_names_no_directory() {
+fn user_path_rejects_a_name_that_names_no_directory() {
     let root = TempDir::new().unwrap();
 
     for name in [".", "./"] {
         assert!(
-            matches!(config_path(root.path(), name, Path::new("")), Err(FsError::EmptyName)),
+            matches!(user_path(root.path(), name, Path::new("")), Err(FsError::EmptyName)),
             "should reject {name}"
         );
     }
 }
 
 #[test]
-fn config_path_rejects_an_escaping_sub_path() {
+fn user_path_rejects_an_escaping_sub_path() {
     let root = TempDir::new().unwrap();
 
     assert!(matches!(
-        config_path(root.path(), "my-app", Path::new("../../.ssh/authorized_keys")),
+        user_path(root.path(), "my-app", Path::new("../../.ssh/authorized_keys")),
         Err(FsError::IllegalPath { .. })
     ));
 }
 
 #[test]
-fn config_path_rejects_an_escaping_name() {
+fn user_path_rejects_an_escaping_name() {
     let root = TempDir::new().unwrap();
 
     assert!(matches!(
-        config_path(root.path(), "../evil", Path::new("")),
+        user_path(root.path(), "../evil", Path::new("")),
         Err(FsError::IllegalPath { .. })
     ));
 }
 
 #[test]
-fn config_path_rejects_an_absolute_sub_path() {
+fn user_path_rejects_an_absolute_sub_path() {
     let root = TempDir::new().unwrap();
 
     assert!(matches!(
-        config_path(root.path(), "my-app", Path::new("/etc/passwd")),
+        user_path(root.path(), "my-app", Path::new("/etc/passwd")),
         Err(FsError::IllegalPath { .. })
     ));
 }
@@ -415,40 +418,78 @@ fn user_config_dir_lands_under_the_platform_config_directory() {
 }
 
 #[test]
-fn mk_config_dir_at_creates_the_directory_and_its_parents() {
+fn user_documents_dir_lands_under_the_platform_documents_directory() {
+    // Touches the real location without creating anything. A platform with no documents directory must say so
+    // rather than invent one.
+    let path = user_documents_dir("rust-sak-test", "exports");
+
+    match dirs::document_dir() {
+        Some(expected) => {
+            let path = path.unwrap();
+            assert_eq!(path, expected.join("rust-sak-test").join("exports"));
+            assert!(!expected.join("rust-sak-test").exists());
+        }
+        None => assert!(matches!(path, Err(FsError::NoDocumentsDir))),
+    }
+}
+
+#[test]
+fn user_documents_dir_validates_like_the_config_dir() {
+    // Both are `user_path` under a different root, so the rules match; this pins that the public function uses them.
+    if dirs::document_dir().is_none() {
+        return;
+    }
+
+    assert!(matches!(user_documents_dir("", ""), Err(FsError::EmptyName)));
+    assert!(matches!(
+        user_documents_dir("../evil", ""),
+        Err(FsError::IllegalPath { .. })
+    ));
+    assert!(matches!(
+        user_documents_dir("my-app", "../../escape"),
+        Err(FsError::IllegalPath { .. })
+    ));
+    assert!(matches!(
+        mk_user_documents_dir("my-app", "../escape"),
+        Err(FsError::IllegalPath { .. })
+    ));
+}
+
+#[test]
+fn mk_user_dir_at_creates_the_directory_and_its_parents() {
     let root = TempDir::new().unwrap();
 
-    let path = mk_config_dir_at(root.path(), "my-app", Path::new("a/b/c")).unwrap();
+    let path = mk_user_dir_at(root.path(), "my-app", Path::new("a/b/c")).unwrap();
     assert!(path.is_dir());
     assert!(root.path().join("my-app").join("a").join("b").is_dir());
 }
 
 #[test]
-fn mk_config_dir_at_succeeds_when_the_directory_already_exists() {
+fn mk_user_dir_at_succeeds_when_the_directory_already_exists() {
     let root = TempDir::new().unwrap();
 
-    let first = mk_config_dir_at(root.path(), "my-app", Path::new("themes")).unwrap();
-    let second = mk_config_dir_at(root.path(), "my-app", Path::new("themes")).unwrap();
+    let first = mk_user_dir_at(root.path(), "my-app", Path::new("themes")).unwrap();
+    let second = mk_user_dir_at(root.path(), "my-app", Path::new("themes")).unwrap();
     assert_eq!(first, second);
     assert!(second.is_dir());
 }
 
 #[test]
-fn mk_config_dir_at_creates_nothing_for_an_illegal_path() {
+fn mk_user_dir_at_creates_nothing_for_an_illegal_path() {
     let root = TempDir::new().unwrap();
 
-    assert!(mk_config_dir_at(root.path(), "my-app", Path::new("../escape")).is_err());
+    assert!(mk_user_dir_at(root.path(), "my-app", Path::new("../escape")).is_err());
     assert!(!root.path().join("my-app").exists());
 }
 
 #[cfg(unix)]
 #[test]
-fn mk_config_dir_at_uses_mode_0755() {
+fn mk_user_dir_at_uses_mode_0755() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = TempDir::new().unwrap();
 
-    let path = mk_config_dir_at(root.path(), "my-app", Path::new("themes")).unwrap();
+    let path = mk_user_dir_at(root.path(), "my-app", Path::new("themes")).unwrap();
     let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o755, "unexpected mode {mode:o}");
 }
@@ -467,7 +508,7 @@ fn mk_config_file_at_creates_the_file_and_its_parents() {
 #[test]
 fn mk_config_file_at_does_not_truncate_an_existing_file() {
     let root = TempDir::new().unwrap();
-    let path = config_path(root.path(), "my-app", Path::new("config.toml")).unwrap();
+    let path = user_path(root.path(), "my-app", Path::new("config.toml")).unwrap();
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, b"keep me").unwrap();
 
@@ -523,7 +564,7 @@ fn mk_config_file_at_leaves_an_existing_files_mode_alone() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = TempDir::new().unwrap();
-    let path = config_path(root.path(), "my-app", Path::new("config.toml")).unwrap();
+    let path = user_path(root.path(), "my-app", Path::new("config.toml")).unwrap();
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, b"secret").unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -2552,6 +2593,7 @@ fn errors_display_usefully() {
     let cases: Vec<(FsError, &str)> = vec![
         (FsError::EmptyName, "empty"),
         (FsError::NoConfigDir, "configuration directory"),
+        (FsError::NoDocumentsDir, "documents directory"),
         (
             FsError::UnknownArchiveFormat {
                 name: "notes.txt".into(),

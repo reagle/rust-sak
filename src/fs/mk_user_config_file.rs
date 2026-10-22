@@ -3,8 +3,8 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-use super::mk_user_config_dir::mk_config_dir_at;
-use super::user_config_dir::{config_path, config_root};
+use super::user_config_dir::config_root;
+use super::user_dir::{mk_user_dir_at, user_path};
 use super::{FsError, Result};
 
 /// The mode new configuration files are created with: readable by all, writable by the owner.
@@ -40,9 +40,9 @@ pub fn mk_user_config_file(name: &str, file_path: impl AsRef<Path>) -> Result<Fi
 /// As [`mk_user_config_file`], minus the platform lookup.
 pub(super) fn mk_config_file_at(root: &Path, name: &str, file_path: &Path) -> Result<File> {
     // Validate the full path first, so an illegal `file_path` is refused before any directory is created for it.
-    let path = config_path(root, name, file_path)?;
+    let path = user_path(root, name, file_path)?;
 
-    // `config_path` drops `.` and empty components, so a `file_path` naming no file at all lands back on the
+    // `user_path` drops `.` and empty components, so a `file_path` naming no file at all lands back on the
     // application directory — which is a directory, not a file the caller can write to.
     let parent = path.parent().ok_or(FsError::EmptyName)?;
     if parent == root {
@@ -50,7 +50,7 @@ pub(super) fn mk_config_file_at(root: &Path, name: &str, file_path: &Path) -> Re
     }
 
     let sub_dir = file_path.parent().unwrap_or_else(|| Path::new(""));
-    mk_config_dir_at(root, name, sub_dir)?;
+    mk_user_dir_at(root, name, sub_dir)?;
 
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);

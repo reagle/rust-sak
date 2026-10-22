@@ -29,15 +29,19 @@ Temporary handles are **RAII**: dropping a `TempDir` or `NamedTempFile` removes 
 
 Both are this crate's own types, wrapping [`tempfile`](https://crates.io/crates/tempfile) rather than re-exporting it, so `tempfile`'s major version is not part of this crate's public API and you can depend on a different one yourself. They expose `path()`, `keep()` and `AsRef<Path>`; `NamedTempFile` also derefs to `std::fs::File`, so `Read`/`Write`/`Seek` work directly on it. Call `.into_inner()` when you need the wrapped `tempfile` value itself.
 
-### User configuration
+### User folders
 
-| Function              | Signature                                                                          | What it does                                          |
-|-----------------------|------------------------------------------------------------------------------------|-------------------------------------------------------|
-| `user_config_dir`     | `fn user_config_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>`    | Computes the path. **No I/O.**                        |
-| `mk_user_config_dir`  | `fn mk_user_config_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>` | Creates it (mode `0o755`) and returns the path.       |
-| `mk_user_config_file` | `fn mk_user_config_file(name: &str, file_path: impl AsRef<Path>) -> Result<File>`  | Creates parents, opens the file read/write (`0o644`). |
+| Function                | Signature                                                                             | What it does                                          |
+|-------------------------|---------------------------------------------------------------------------------------|-------------------------------------------------------|
+| `user_config_dir`       | `fn user_config_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>`       | Computes the path. **No I/O.**                        |
+| `mk_user_config_dir`    | `fn mk_user_config_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>`    | Creates it (mode `0o755`) and returns the path.       |
+| `mk_user_config_file`   | `fn mk_user_config_file(name: &str, file_path: impl AsRef<Path>) -> Result<File>`     | Creates parents, opens the file read/write (`0o644`). |
+| `user_documents_dir`    | `fn user_documents_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>`    | Computes the path. **No I/O.**                        |
+| `mk_user_documents_dir` | `fn mk_user_documents_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>` | Creates it (mode `0o755`) and returns the path.       |
 
-The path is `<platform config dir>/<name>/<sub_path>` — `~/.config/…` on Linux, `~/Library/Application Support/…` on macOS, `%APPDATA%\…` on Windows. `mk_user_config_file` **does not truncate**, so an existing config survives being opened.
+The config path is `<platform config dir>/<name>/<sub_path>` — `~/.config/…` on Linux, `~/Library/Application Support/…` on macOS, `%APPDATA%\…` on Windows. `mk_user_config_file` **does not truncate**, so an existing config survives being opened.
+
+The documents path is `<documents dir>/<name>/<sub_path>` — `~/Documents/…` on macOS and Windows, the XDG documents directory on Linux. A platform without one (Linux with no XDG user directories, a Windows profile with no Documents known folder) returns `NoDocumentsDir`, so the caller can fall back somewhere deliberate.
 
 Both `name` and `sub_path` are validated with the same rules as archive entries, so a `sub_path` of `../../.ssh/authorized_keys` is refused rather than quietly resolved.
 
@@ -182,6 +186,6 @@ the bytes on disk.
 
 ## Errors
 
-Everything returns `fs::Result<T>` (`Result<T, FsError>`). `FsError` wraps the underlying libraries (`Io`, which also covers `tar` and `liblzma`; `Zip`; `SevenZ`) and adds this module's own: `EmptyName`, `NoConfigDir`, `UnknownArchiveFormat` (carrying the file name it rejected), `IllegalPath`, `IllegalSymlink`, `DeclaredSizeMismatch`, `LimitExceeded` (carrying a typed `Limit`), `Trash` and `Restore` (each carrying the path and the platform's reason).
+Everything returns `fs::Result<T>` (`Result<T, FsError>`). `FsError` wraps the underlying libraries (`Io`, which also covers `tar` and `liblzma`; `Zip`; `SevenZ`) and adds this module's own: `EmptyName`, `NoConfigDir`, `NoDocumentsDir`, `UnknownArchiveFormat` (carrying the file name it rejected), `IllegalPath`, `IllegalSymlink`, `DeclaredSizeMismatch`, `LimitExceeded` (carrying a typed `Limit`), `Trash` and `Restore` (each carrying the path and the platform's reason).
 
 Rejections happen **before** anything is written, so an `IllegalPath` or `IllegalSymlink` means nothing landed outside the target directory. Extraction stops at the first bad entry; entries already written stay on disk.

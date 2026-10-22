@@ -50,6 +50,9 @@ pub enum FsError {
     /// The user's configuration directory could not be determined for this platform.
     #[error("the user configuration directory could not be determined")]
     NoConfigDir,
+    /// The user's documents directory could not be determined for this platform.
+    #[error("the user documents directory could not be determined")]
+    NoDocumentsDir,
     /// The archive's extension is not one this module can extract.
     #[error("unknown archive format: {name}")]
     UnknownArchiveFormat {
