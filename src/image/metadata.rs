@@ -35,12 +35,26 @@ pub struct Metadata {
     /// `Photoshop 3.0`. The IPTC-IIM data is its resource `0x0404`. Embedded in JPEG only (split across `APP13`
     /// segments above 65,519 bytes); no other format has a standard place for it.
     pub iptc: Option<Vec<u8>>,
+    /// The payload of a JPEG's ISO 21496-1 `APP2` segment — everything after its `urn:iso:std:iso:ts:21496:-1\0`
+    /// header: in a primary image the 4-byte version marker (minimum and writer version), in a gain-map image the whole
+    /// binary gain-map metadata. Embedded in JPEG only, as one `APP2` (at most 65,505 bytes).
+    pub iso_gain_map: Option<Vec<u8>>,
+    /// A JPEG's gain-map image: a complete JPEG from `SOI` to `EOI`, byte for byte, its own XMP and ISO 21496-1
+    /// metadata inside it. Read from the primary's MPF index (the entry of type Gain Map, or the first secondary entry
+    /// when the primary declares a gain map); embedded in JPEG only, appended after the primary's `EOI` and located by
+    /// an MPF `APP2` index this crate writes (at most 64 MiB). See the module README's *Gain maps* section.
+    pub gain_map: Option<Vec<u8>>,
 }
 
 impl Metadata {
     /// Whether there is nothing to embed.
     pub fn is_empty(&self) -> bool {
-        self.icc_profile.is_none() && self.exif.is_none() && self.xmp.is_none() && self.iptc.is_none()
+        self.icc_profile.is_none()
+            && self.exif.is_none()
+            && self.xmp.is_none()
+            && self.iptc.is_none()
+            && self.iso_gain_map.is_none()
+            && self.gain_map.is_none()
     }
 }
 
@@ -63,4 +77,8 @@ pub struct Embedded {
     pub xmp: bool,
     /// The [`Metadata::iptc`] block was written into the file.
     pub iptc: bool,
+    /// The [`Metadata::iso_gain_map`] payload was written into the file.
+    pub iso_gain_map: bool,
+    /// The [`Metadata::gain_map`] image was written into the file, with the MPF index that locates it.
+    pub gain_map: bool,
 }

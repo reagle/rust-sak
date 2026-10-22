@@ -55,7 +55,7 @@ are pure pixel arithmetic with nothing to fail, so they return their picture dir
 | `icc_profile_description` | `fn icc_profile_description(profile: &[u8]) -> Option<String>` | A profile's own description (`Display P3`), as `ImageInfo::color_profile` reports it. |
 | `icc_profile_file`  | `fn icc_profile_file(path: impl AsRef<Path>) -> Result<Option<Vec<u8>>>` | Same, for a file; format from the **extension**. Reads only the header for native formats, a 64 KiB prefix (or the whole file, if the profile lies further in) for the containers. |
 | `exif_field`        | `fn exif_field(exif: &[u8], ifd: ExifIfd, tag: u16) -> Option<ExifValue>` | One `ASCII`, `SHORT` or `LONG` field of an EXIF block. See [Editing EXIF](#editing-exif). |
-| `metadata_bytes`    | `fn metadata_bytes(bytes: &[u8]) -> Metadata` | Everything `Metadata` carries — ICC profile, EXIF, XMP, IPTC — **byte for byte**; format from **magic bytes**. Infallible. See [Metadata blocks](#metadata-blocks). |
+| `metadata_bytes`    | `fn metadata_bytes(bytes: &[u8]) -> Metadata` | Everything `Metadata` carries — ICC profile, EXIF, XMP, IPTC, and a JPEG's gain-map container — **byte for byte**; format from **magic bytes**. Infallible. See [Metadata blocks](#metadata-blocks) and [Gain maps](#gain-maps). |
 | `hdr_bytes`         | `fn hdr_bytes(bytes: &[u8]) -> Option<Hdr>` | Whether the file **declares HDR** — a JPEG gain map, or a PQ/HLG transfer — from its headers; format from **magic bytes**. Infallible. See [HDR detection](#hdr-detection). |
 
 ### Transforming
@@ -207,6 +207,41 @@ assert!(embedded.xmp && !embedded.iptc);
 assert_eq!(metadata_bytes(&png).xmp, metadata.xmp);
 ```
 
+### Gain maps
+
+An Ultra HDR / ISO 21496-1 / Adobe gain-map JPEG is an 8-bit SDR primary image plus a **gain map**, a second JPEG appended after the primary's `EOI` that records how much brighter each part of the scene is in the HDR rendition. A decoder that does not know about it sees an ordinary JPEG; re-encoding the primary alone throws the HDR away. `Metadata` carries the container so a program can put it back:
+
+| Field | What it holds | Read from | Written as |
+|---|---|---|---|
+| `iso_gain_map` | The payload of the `APP2` `urn:iso:std:iso:ts:21496:-1\0` segment, after the URN: a primary's 4-byte version marker (minimum and writer version), or a gain-map image's whole binary metadata. | The first such segment ahead of the first scan. | One `APP2` after the descriptive blocks, at most 65,505 bytes (larger is left out). |
+| `gain_map` | The gain-map image, a complete JPEG from `SOI` to `EOI`, its own `hdrgm` XMP and ISO payload inside it. | The image the primary's MPF `APP2` index locates. | Appended after the primary's `EOI`, located by an MPF index written for it. |
+
+**Nothing about the gain map is interpreted**: no gain-map maths, no XMP parsing, no pixels. To resize or crop one, decode `gain_map` with `decode_bytes`, transform it, encode it again (with its own `metadata_bytes(&gain_map)` `xmp` and `iso_gain_map` embedded through `encode_*_with`), and hand the result back as `gain_map` with the primary's own `xmp` and `iso_gain_map`. **A gain map follows the primary's EXIF orientation, which it does not carry itself**: `decode_bytes` turns the primary upright, so turn the decoded gain map the same way (the primary's Orientation, `0x0112`, read with `exif_field`) before writing it beside the upright primary. Every format other than JPEG reads `None` for both and writes neither (`Embedded` reports `false`).
+
+**Reading.** The first MPF `APP2` index is walked like the rest of the module's untrusted input — every read bounded by the segment, in either byte order. Of at most the first two secondary entries, the one of type Gain Map (CIPA DC-007 `0x050000`) is taken; failing that, the first secondary entry, but only when the primary declares a gain map with an ISO marker or `hdrgm` XMP (Android writes its gain map's type as 0). It is located **by its own offset and size only**: a primary's recorded size is often stale (an editor that grew the primary's metadata updates the offsets and not that size), so it is never used. The image must lie inside the file after the index, start with `SOI`, hold an `EOI` (it is cut there, dropping padding) and be at most 64 MiB; otherwise `gain_map` is `None` and everything else is still read.
+
+**Writing.** With a `gain_map` that is a complete JPEG, the JPEG encode writes, in order after `APP0`: `APP1` EXIF, `APP1` XMP, `APP13` Photoshop, `APP2` ISO 21496-1, `APP2` MPF index, then the encoder's own `APP2` ICC profile and the image; then the gain map, tightly packed after the primary's `EOI`. The index is big-endian, as Lightroom and `libultrahdr` write it — 88 bytes of segment (90 with its marker): `MPFVersion` `0100`, `NumberOfImages` 2, and two MP Entries, the primary (representative, Baseline MP Primary, offset 0) and the gain map (type Gain Map). It is spliced with its sizes and offset zero and patched once the primary's final length is known; its size is fixed, so patching moves nothing. The primary's size is the whole primary, `SOI` to `EOI`; the gain map's offset is from the index's TIFF header (`MM`), as CIPA DC-007 defines it. A gain map that is not a complete JPEG is left out with its index, and `Embedded::gain_map` is `false`; the encode still succeeds.
+
+```rust
+use image::{DynamicImage, GrayImage, RgbImage};
+use rust_sak::image::{Hdr, ImageFormat, Metadata, encode_writer, encode_writer_with, hdr_bytes, metadata_bytes};
+
+let mut gain_map = Vec::new();
+encode_writer(&DynamicImage::ImageLuma8(GrayImage::new(2, 2)), &mut gain_map, ImageFormat::Jpeg, None).unwrap();
+
+let mut metadata = Metadata::default();
+metadata.iso_gain_map = Some(vec![0, 0, 0, 0]);
+metadata.gain_map = Some(gain_map.clone());
+let mut jpeg = Vec::new();
+let embedded = encode_writer_with(
+    &DynamicImage::ImageRgb8(RgbImage::new(4, 4)), &mut jpeg, ImageFormat::Jpeg, None, &metadata,
+).unwrap();
+
+assert!(embedded.gain_map && embedded.iso_gain_map);
+assert_eq!(metadata_bytes(&jpeg).gain_map, Some(gain_map));
+assert_eq!(hdr_bytes(&jpeg), Some(Hdr::GainMap));
+```
+
 ### Editing EXIF
 
 A program that re-encodes a photograph usually has to change a few EXIF fields first: the pixel dimensions after a resize, the software that wrote the file, the thumbnail of a picture that no longer looks like it, and the Orientation (`0x0112`), which is `1` once the decode has turned the pixels upright (BMP, GIF, JPEG, PNG, TIFF and RAW; not AVIF, HEIF or WebP). **`patch_exif` changes fields without moving any byte that is kept**, which is what keeps a **MakerNote** valid: the camera maker's private block, whose internal pointers are — for Canon, Sony, Pentax, Samsung and others — absolute from the start of the TIFF stream, so that any tool that rebuilds the block from parsed fields silently corrupts it.
@@ -244,6 +279,8 @@ assert_eq!(exif_field(&patched, ExifIfd::Primary, 0x0112), Some(ExifValue::Short
 > **Then:** `exif_field`, `patch_exif`, `rebuild_exif`, `ExifEdit`, `ExifIfd`, `ExifValue`, `ExifError`, `Rebuilt` and `MAX_JPEG_EXIF_LEN`. (Fork tag `26.10.1-meta.2`.)
 >
 > **Then:** `ExifError::ThumbnailUnremovable`; `patch_exif` no longer reuses or trims bytes it did not free, always zeroes a dropped thumbnail, and treats header offsets as no value; the extended-XMP join carries the extended packet's outer namespace declarations. (Fork tag `26.10.1-meta.3`.)
+>
+> **Then:** the `iso_gain_map` and `gain_map` fields of `Metadata` and `Embedded`: a JPEG's ISO 21496-1 payload and MPF gain-map image read by `metadata_bytes` and written back, with an MPF index, by `encode_*_with`. (Fork tag `26.10.1-meta.5`.)
 
 ## RAW decoding (`image-raw`)
 

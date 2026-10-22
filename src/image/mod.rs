@@ -23,10 +23,10 @@
 //!   bytes that are kept (so a MakerNote stays valid), or rebuild compactly without the MakerNote.
 //! - [`hdr_bytes`] — whether a file declares HDR ([`Hdr`]: a JPEG gain map, or a PQ/HLG transfer), without decoding
 //!   the pixels.
-//! - [`metadata_bytes`] — read everything a [`Metadata`] carries (ICC profile, EXIF, XMP, IPTC) without decoding the
-//!   pixels.
+//! - [`metadata_bytes`] — read everything a [`Metadata`] carries (ICC profile, EXIF, XMP, IPTC, a JPEG's gain-map
+//!   container) without decoding the pixels.
 //! - [`encode_file_with`] / [`encode_writer_with`] — the same, embedding the [`Metadata`] given (an ICC profile, EXIF,
-//!   XMP, IPTC) where the format can hold it, and reporting what was written as [`Embedded`].
+//!   XMP, IPTC, a JPEG's gain map) where the format can hold it, and reporting what was written as [`Embedded`].
 //!
 //! Lossy/codec-specific settings are supplied per format via [`EncodeOptions`]; pass `None` to use sensible defaults.
 //!

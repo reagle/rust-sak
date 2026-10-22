@@ -20,6 +20,11 @@ use super::{Embedded, EncodeOptions, ImageFormat, Metadata};
 /// | WebP | `ICCP` chunk, with a `VP8X` header added or updated | `EXIF` | `XMP ` | not written |
 /// | BMP, GIF, AVIF, HEIF | not written | not written | not written | not written |
 ///
+/// A JPEG also takes a gain-map container: [`Metadata::iso_gain_map`] as an `APP2` ISO 21496-1 segment after the
+/// blocks above, and [`Metadata::gain_map`] appended after the primary's `EOI`, located by an `APP2` MPF index written
+/// after that segment and patched with both images' sizes and the gain map's offset (see the module README's *Gain
+/// maps*). No other format holds either.
+///
 /// A block the format cannot hold is left out and reported `false` in the returned [`Embedded`]; the encode still
 /// succeeds. With [`Metadata::default()`] the bytes are exactly those [`encode_writer`](super::encode_writer) writes.
 ///
