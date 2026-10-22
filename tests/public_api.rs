@@ -131,6 +131,28 @@ mod image {
     }
 
     #[test]
+    fn an_icc_profile_round_trips_through_the_public_api() {
+        use rust_sak::image::{Embedded, Metadata, encode_writer_with, icc_profile_bytes, icc_profile_description};
+
+        let mut profile = vec![0_u8; 256];
+        profile[0..4].copy_from_slice(&256_u32.to_be_bytes());
+        profile[36..40].copy_from_slice(b"acsp");
+
+        // `#[non_exhaustive]`: built from `Default` and assigned, as a downstream crate has to.
+        let mut metadata = Metadata::default();
+        metadata.icc_profile = Some(profile.clone());
+
+        let original = image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4));
+        let mut bytes = Vec::new();
+        let embedded: Embedded = encode_writer_with(&original, &mut bytes, ImageFormat::Jpeg, None, &metadata).unwrap();
+
+        assert!(embedded.icc_profile);
+        assert_eq!(icc_profile_bytes(&bytes).unwrap(), Some(profile.clone()));
+        // A profile with no `desc` tag has no name to give.
+        assert_eq!(icc_profile_description(&profile), None);
+    }
+
+    #[test]
     fn rotate_is_reachable_and_expands_the_canvas() {
         let original = image::DynamicImage::ImageRgb8(image::RgbImage::new(240, 120));
         let rotated = rotate(&original, 30.0);

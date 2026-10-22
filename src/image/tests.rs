@@ -1090,6 +1090,429 @@ mod color_profile {
             let _ = super::super::container::color_profile(&garbage, format);
         }
     }
+
+    // ── Profile bytes: reading ──
+
+    /// `image` as a TIFF with `profile` in tag 34675, written straight through the `image` crate's encoder so these
+    /// read-side tests do not lean on `encode_writer_with`.
+    fn tiff_with_icc(image: &DynamicImage, profile: Vec<u8>) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        let mut encoder = ::image::codecs::tiff::TiffEncoder::new(&mut bytes);
+        encoder.set_icc_profile(profile).unwrap();
+        image.write_with_encoder(encoder).unwrap();
+        bytes.into_inner()
+    }
+
+    /// One file per format that can carry a profile, each carrying `profile`.
+    fn tagged_in_every_capable_format(profile: &[u8]) -> Vec<(ImageFormat, Vec<u8>)> {
+        let small = sample_image_sized(16, 8);
+        vec![
+            (
+                ImageFormat::Jpeg,
+                encode_with_icc(&small, ImageFormat::Jpeg, profile.to_vec()),
+            ),
+            (
+                ImageFormat::Png,
+                encode_with_icc(&small, ImageFormat::Png, profile.to_vec()),
+            ),
+            (ImageFormat::Tiff, tiff_with_icc(&small, profile.to_vec())),
+            (
+                ImageFormat::WebP,
+                webp_with_icc(&encode(&small, ImageFormat::WebP), 16, 8, profile),
+            ),
+            (
+                ImageFormat::Avif,
+                with_properties(
+                    &encode(&sample_image_sized(64, 64), ImageFormat::Avif),
+                    &[colr_prof(profile)],
+                ),
+            ),
+            (
+                ImageFormat::Heif,
+                with_properties(&encode(&small, ImageFormat::Heif), &[colr_prof(profile)]),
+            ),
+        ]
+    }
+
+    fn icc_via_file(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
+        let path = std::env::temp_dir().join(format!(
+            "rust_sak_icc_bytes_{}_{:?}.{}",
+            std::process::id(),
+            std::thread::current().id(),
+            format.extension()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let profile = icc_profile_file(&path);
+        std::fs::remove_file(&path).unwrap();
+        profile.unwrap()
+    }
+
+    #[test]
+    fn the_embedded_profile_is_returned_byte_for_byte_in_every_capable_format() {
+        let profile = icc_v4(&[("en", "Display P3")]);
+        for (format, bytes) in tagged_in_every_capable_format(&profile) {
+            assert_eq!(format_from_bytes(&bytes).unwrap(), format);
+            assert_eq!(icc_profile_bytes(&bytes).unwrap(), Some(profile.clone()), "{format:?}");
+            assert_eq!(
+                icc_via_file(&bytes, format),
+                Some(profile.clone()),
+                "{format:?} from a file"
+            );
+            // The name a probe reports is read from the same bytes.
+            assert_eq!(
+                probe_bytes(&bytes).unwrap().color_profile.as_deref(),
+                Some("Display P3"),
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_without_a_profile_has_none_in_every_format() {
+        for format in ImageFormat::ALL {
+            let image = if format == ImageFormat::Avif {
+                sample_image_sized(64, 64)
+            } else {
+                sample_image()
+            };
+            let bytes = encode(&image, format);
+            assert_eq!(icc_profile_bytes(&bytes).unwrap(), None, "{format:?}");
+            assert_eq!(icc_via_file(&bytes, format), None, "{format:?} from a file");
+        }
+    }
+
+    #[test]
+    fn a_coded_only_colour_description_is_no_profile() {
+        let avif = with_nclx(&encode(&sample_image_sized(64, 64), ImageFormat::Avif), 12, 13);
+        assert_eq!(probe_bytes(&avif).unwrap().color_profile.as_deref(), Some("Display P3"));
+        assert_eq!(icc_profile_bytes(&avif).unwrap(), None);
+    }
+
+    #[test]
+    fn a_profile_past_the_prefix_is_read_whole_from_a_file() {
+        let profile = oversized_icc("Display P3");
+        for (format, bytes) in tagged_in_every_capable_format(&profile) {
+            assert_eq!(icc_via_file(&bytes, format), Some(profile.clone()), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn bytes_that_cannot_be_a_profile_are_none() {
+        let mut unsigned = icc_v4(&[("en", "Display P3")]);
+        unsigned[36..40].copy_from_slice(b"xxxx");
+        let short = b"tiny".to_vec();
+        for profile in [unsigned, short] {
+            let png = encode_with_icc(&sample_image(), ImageFormat::Png, profile);
+            assert_eq!(icc_profile_bytes(&png).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn unrecognised_bytes_and_extensions_are_errors() {
+        assert!(matches!(
+            icc_profile_bytes(b"not an image at all"),
+            Err(ImageError::UnrecognizedFormat)
+        ));
+        assert!(matches!(
+            icc_profile_file("photo.unknown"),
+            Err(ImageError::UnknownExtension)
+        ));
+    }
+
+    #[test]
+    fn truncated_or_garbled_files_never_panic() {
+        let profile = icc_v4(&[("en", "Display P3")]);
+        for (format, bytes) in tagged_in_every_capable_format(&profile) {
+            for len in 0..bytes.len() {
+                let _ = icc_profile_bytes(&bytes[..len]);
+            }
+            let mut garbage = bytes.clone();
+            for byte in garbage.iter_mut().skip(12).step_by(7) {
+                *byte = 0xFF;
+            }
+            let _ = icc_profile_bytes(&garbage);
+            let _ = format;
+        }
+    }
+
+    // ── Profile bytes: embedding ──
+
+    fn with_profile(profile: &[u8]) -> Metadata {
+        Metadata {
+            icc_profile: Some(profile.to_vec()),
+        }
+    }
+
+    fn encode_tagged(image: &DynamicImage, format: ImageFormat, profile: &[u8]) -> (Vec<u8>, Embedded) {
+        let mut bytes = Vec::new();
+        let embedded = encode_writer_with(image, &mut bytes, format, None, &with_profile(profile)).unwrap();
+        (bytes, embedded)
+    }
+
+    /// The pictures a round trip is checked with: 8- and 16-bit, with and without alpha, and grayscale.
+    fn round_trip_images() -> Vec<DynamicImage> {
+        let image = sample_image_sized(16, 8);
+        // A varying alpha, so an encoder that drops an opaque channel cannot pass for one that kept it.
+        let mut rgba = image.to_rgba8();
+        for (x, _, px) in rgba.enumerate_pixels_mut() {
+            px[3] = (x * 16) as u8;
+        }
+        let rgba = DynamicImage::ImageRgba8(rgba);
+        vec![
+            DynamicImage::ImageRgb8(image.to_rgb8()),
+            DynamicImage::ImageRgba16(rgba.to_rgba16()),
+            rgba,
+            DynamicImage::ImageRgb16(image.to_rgb16()),
+            DynamicImage::ImageLuma8(image.to_luma8()),
+        ]
+    }
+
+    const EMBEDDING: [ImageFormat; 4] = [
+        ImageFormat::Jpeg,
+        ImageFormat::Png,
+        ImageFormat::Tiff,
+        ImageFormat::WebP,
+    ];
+
+    #[test]
+    fn the_profile_round_trips_through_every_embedding_format() {
+        let profile = icc_v4(&[("en", "Display P3")]);
+        for format in EMBEDDING {
+            for image in round_trip_images() {
+                let (bytes, embedded) = encode_tagged(&image, format, &profile);
+                let color = image.color();
+                assert!(embedded.icc_profile, "{format:?} {color:?} reported no profile");
+                assert_eq!(
+                    icc_profile_bytes(&bytes).unwrap(),
+                    Some(profile.clone()),
+                    "{format:?} {color:?}"
+                );
+
+                let decoded = decode_bytes(&bytes).unwrap();
+                assert_eq!((decoded.width(), decoded.height()), (16, 8), "{format:?} {color:?}");
+                if format != ImageFormat::Jpeg {
+                    assert_eq!(
+                        decoded.color().has_alpha(),
+                        color.has_alpha(),
+                        "{format:?} {color:?} alpha"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_profile_over_64_kib_round_trips() {
+        // Above one JPEG segment's capacity, so the profile is split across several `APP2` segments and reassembled.
+        let profile = oversized_icc("Display P3");
+        for format in EMBEDDING {
+            let (bytes, embedded) = encode_tagged(&sample_image_sized(16, 8), format, &profile);
+            assert!(embedded.icc_profile, "{format:?}");
+            assert_eq!(icc_profile_bytes(&bytes).unwrap(), Some(profile.clone()), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn a_profile_too_large_for_the_format_is_left_out_and_the_encode_succeeds() {
+        let image = sample_image_sized(16, 8);
+
+        // One byte over what JPEG's 255 `APP2` segments hold, but within what PNG can carry.
+        let mut over_jpeg = icc_v4(&[("en", "Display P3")]);
+        over_jpeg.resize(255 * 65_519 + 1, 0);
+        let (jpeg, embedded) = encode_tagged(&image, ImageFormat::Jpeg, &over_jpeg);
+        assert!(!embedded.icc_profile);
+        assert_eq!(
+            jpeg,
+            encode(&image, ImageFormat::Jpeg),
+            "the JPEG differs from one written with no profile"
+        );
+        let (png, embedded) = encode_tagged(&image, ImageFormat::Png, &over_jpeg);
+        assert!(embedded.icc_profile);
+        assert_eq!(icc_profile_bytes(&png).unwrap(), Some(over_jpeg));
+
+        // Over the module's own bound, refused everywhere.
+        let mut huge = icc_v4(&[("en", "Display P3")]);
+        huge.resize(super::super::dispatch::MAX_ICC_PROFILE_LEN + 1, 0);
+        for format in EMBEDDING {
+            let (bytes, embedded) = encode_tagged(&image, format, &huge);
+            assert!(!embedded.icc_profile, "{format:?}");
+            assert_eq!(icc_profile_bytes(&bytes).unwrap(), None, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn formats_that_cannot_hold_a_profile_say_so_and_write_what_they_always_did() {
+        let profile = icc_v4(&[("en", "Display P3")]);
+        for format in [ImageFormat::Bmp, ImageFormat::Gif, ImageFormat::Avif, ImageFormat::Heif] {
+            let image = if format == ImageFormat::Avif {
+                sample_image_sized(64, 64)
+            } else {
+                sample_image()
+            };
+            let (bytes, embedded) = encode_tagged(&image, format, &profile);
+            assert!(!embedded.icc_profile, "{format:?}");
+            assert_eq!(icc_profile_bytes(&bytes).unwrap(), None, "{format:?}");
+            // AVIF and HEIF encodes are not deterministic byte for byte across runs, so only the lossless pair is
+            // compared.
+            if matches!(format, ImageFormat::Bmp | ImageFormat::Gif) {
+                assert_eq!(bytes, encode(&image, format), "{format:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_metadata_writes_exactly_what_encode_writer_does() {
+        for format in ImageFormat::ALL {
+            if matches!(format, ImageFormat::Avif | ImageFormat::Heif) {
+                continue;
+            }
+            let image = sample_image();
+            let mut with = Vec::new();
+            let embedded = encode_writer_with(&image, &mut with, format, None, &Metadata::default()).unwrap();
+            assert_eq!(embedded, Embedded::default(), "{format:?}");
+            assert_eq!(with, encode(&image, format), "{format:?}");
+        }
+
+        // TIFF moved from `write_to` to its encoder; the bytes did not move with it.
+        for image in round_trip_images() {
+            let mut before = Cursor::new(Vec::new());
+            image.write_to(&mut before, ::image::ImageFormat::Tiff).unwrap();
+            assert_eq!(
+                encode(&image, ImageFormat::Tiff),
+                before.into_inner(),
+                "{:?}",
+                image.color()
+            );
+        }
+    }
+
+    #[test]
+    fn encode_file_with_embeds_and_reports() {
+        let profile = icc_v2("sRGB IEC61966-2.1");
+        for format in EMBEDDING {
+            let path = std::env::temp_dir().join(format!(
+                "rust_sak_encode_with_{}_{:?}.{}",
+                std::process::id(),
+                std::thread::current().id(),
+                format.extension()
+            ));
+            let embedded = encode_file_with(&sample_image(), &path, None, &with_profile(&profile)).unwrap();
+            let read = icc_profile_file(&path);
+            std::fs::remove_file(&path).unwrap();
+            assert!(embedded.icc_profile, "{format:?}");
+            assert_eq!(read.unwrap(), Some(profile.clone()), "{format:?}");
+        }
+    }
+
+    // ── WebP chunk rewrite ──
+
+    fn webp_options(lossless: bool) -> EncodeOptions {
+        match EncodeOptions::default_for(ImageFormat::WebP) {
+            EncodeOptions::WebP {
+                quality,
+                quality_alpha,
+                compression,
+                threads,
+                ..
+            } => EncodeOptions::WebP {
+                quality,
+                quality_alpha,
+                compression,
+                lossless,
+                threads,
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// The four-character codes of a WebP file's chunks, in order.
+    fn webp_chunks(bytes: &[u8]) -> Vec<[u8; 4]> {
+        let mut rest = &bytes[12..];
+        let mut kinds = Vec::new();
+        while !rest.is_empty() {
+            let (kind, _, next) = super::super::container::riff_chunk(rest).unwrap();
+            kinds.push(kind);
+            rest = next;
+        }
+        kinds
+    }
+
+    #[test]
+    fn webp_lossy_lossless_and_alpha_carry_the_profile() {
+        // An odd length, so the `ICCP` chunk needs its pad byte.
+        let mut profile = icc_v4(&[("en", "Display P3")]);
+        if profile.len().is_multiple_of(2) {
+            profile.push(0);
+        }
+
+        let opaque = sample_image_sized(16, 8);
+        let mut transparent = opaque.to_rgba8();
+        for (x, _, px) in transparent.enumerate_pixels_mut() {
+            px[3] = (x * 16) as u8;
+        }
+        let transparent = DynamicImage::ImageRgba8(transparent);
+
+        for lossless in [false, true] {
+            for image in [&opaque, &transparent] {
+                let alpha = image.color().has_alpha();
+                let mut plain = Vec::new();
+                encode_writer(image, &mut plain, ImageFormat::WebP, Some(webp_options(lossless))).unwrap();
+                let mut tagged = Vec::new();
+                let embedded = encode_writer_with(
+                    image,
+                    &mut tagged,
+                    ImageFormat::WebP,
+                    Some(webp_options(lossless)),
+                    &with_profile(&profile),
+                )
+                .unwrap();
+                let case = format!("lossless={lossless} alpha={alpha} chunks={:?}", webp_chunks(&plain));
+
+                assert!(embedded.icc_profile, "{case}");
+                assert_eq!(icc_profile_bytes(&tagged).unwrap(), Some(profile.clone()), "{case}");
+                assert_eq!(webp_chunks(&tagged)[..2], [*b"VP8X", *b"ICCP"], "{case}");
+                // Exactly one `VP8X`, whether the encoder wrote one or not.
+                assert_eq!(
+                    webp_chunks(&tagged).iter().filter(|k| *k == b"VP8X").count(),
+                    1,
+                    "{case}"
+                );
+                let riff = u32::from_le_bytes(tagged[4..8].try_into().unwrap()) as usize;
+                assert_eq!(riff, tagged.len() - 8, "{case}");
+
+                let decoded = decode_bytes(&tagged).unwrap();
+                assert_eq!(decoded, decode_bytes(&plain).unwrap(), "{case}: the pixels changed");
+                assert_eq!(decoded.color().has_alpha(), alpha, "{case}");
+                let info = probe_bytes(&tagged).unwrap();
+                assert_eq!((info.width, info.height), (16, 8), "{case}");
+                assert_eq!(info.color_profile.as_deref(), Some("Display P3"), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_webp_rewrite_refuses_what_it_cannot_parse_without_panicking() {
+        use super::super::riff::with_iccp;
+
+        let profile = icc_v4(&[("en", "Display P3")]);
+        assert_eq!(with_iccp(b"", &profile), None);
+        assert_eq!(with_iccp(b"RIFF\x04\0\0\0WEBP", &profile), None);
+        let plain = encode(&sample_image_sized(16, 8), ImageFormat::WebP);
+        for len in 0..plain.len() {
+            let _ = with_iccp(&plain[..len], &profile);
+        }
+        let mut garbage = plain.clone();
+        for byte in garbage.iter_mut().skip(12).step_by(5) {
+            *byte = 0xFF;
+        }
+        let _ = with_iccp(&garbage, &profile);
+        // A profile already there is replaced, not duplicated.
+        let once = with_iccp(&plain, &profile).unwrap();
+        let other = icc_v2("sRGB IEC61966-2.1");
+        let twice = with_iccp(&once, &other).unwrap();
+        assert_eq!(webp_chunks(&twice).iter().filter(|k| *k == b"ICCP").count(), 1);
+        assert_eq!(icc_profile_bytes(&twice).unwrap(), Some(other));
+    }
 }
 
 // ── RAW ────────────────────────────────────────────────────────────────────────────────────────────────────────

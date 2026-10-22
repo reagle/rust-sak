@@ -4,13 +4,15 @@ use std::sync::{Mutex, PoisonError};
 
 use ::image::codecs::jpeg::JpegEncoder;
 use ::image::codecs::png::PngEncoder;
-use ::image::{DynamicImage, ImageDecoder, ImageReader};
+use ::image::codecs::tiff::{TiffDecoder, TiffEncoder};
+use ::image::{DynamicImage, ImageDecoder, ImageEncoder, ImageReader};
 
 use super::container;
 use super::error::{ImageError, Result};
 use super::icc;
 use super::info::ImageInfo;
-use super::{EncodeOptions, ImageFormat};
+use super::riff;
+use super::{Embedded, EncodeOptions, ImageFormat, Metadata};
 
 /// What a decode should be routed to: one of the formats [`ImageFormat`] names, or camera RAW.
 ///
@@ -157,8 +159,8 @@ pub(super) fn probe_native(reader: impl BufRead + Seek, format: ImageFormat) -> 
     let image_format = format
         .to_image_format()
         .expect("native formats map to image::ImageFormat");
-    // `into_decoder` parses the header only; `read_image` (never called here) is what decodes pixels.
-    let mut decoder = ImageReader::with_format(reader, image_format).into_decoder()?;
+    // Parses the header only; `read_image` (never called here) is what decodes pixels.
+    let mut decoder = native_decoder(reader, image_format)?;
 
     let (width, height) = decoder.dimensions();
     let color_type = decoder.color_type();
@@ -179,6 +181,67 @@ pub(super) fn probe_native(reader: impl BufRead + Seek, format: ImageFormat) -> 
         bit_depth,
         color_profile,
     })
+}
+
+/// The largest ICC profile read or embedded. The JPEG `APP2` scheme tops out just under 16 MiB (255 segments of 65,519
+/// bytes), real profiles are kilobytes to a few megabytes, and the bytes come from an untrusted file — a PNG's `iCCP`
+/// is compressed, so its size is not bounded by the file's — so anything larger is treated as no profile.
+pub(super) const MAX_ICC_PROFILE_LEN: usize = 16 * 1024 * 1024;
+
+/// The ICC profile bytes `profile`, if they can be one: at least the 128-byte header, the `acsp` signature where the
+/// header puts it, and no larger than [`MAX_ICC_PROFILE_LEN`]. Nothing else is interpreted.
+pub(super) fn usable_profile(profile: &[u8]) -> Option<Vec<u8>> {
+    let usable = profile.len() >= 128 && profile.len() <= MAX_ICC_PROFILE_LEN && &profile[36..40] == b"acsp";
+    usable.then(|| profile.to_vec())
+}
+
+/// Reads the embedded ICC profile of `bytes` known to be in `format`, without decoding the pixels. Shared by
+/// [`icc_profile_bytes`](super::icc_profile_bytes); [`icc_profile_file`](super::icc_profile_file) reaches the same two
+/// paths itself, so it can read only a header from disk.
+pub(super) fn icc_profile_with_format(bytes: &[u8], format: ImageFormat) -> Result<Option<Vec<u8>>> {
+    if format.to_image_format().is_some() {
+        return icc_profile_native(Cursor::new(bytes), format);
+    }
+    // A container that ends early or cannot be walked declares nothing this can use; see `container_profile`.
+    Ok(container::icc_profile(bytes, format)
+        .unwrap_or_default()
+        .and_then(usable_profile))
+}
+
+/// Reads the embedded ICC profile of a native-format image from `reader`, parsing only its header — the same decoder
+/// [`probe_native`] asks for the profile's name.
+///
+/// # Panics
+///
+/// If `format` is one of the formats with a dedicated codec (`avif`/`heif`/`webp`).
+pub(super) fn icc_profile_native(reader: impl BufRead + Seek, format: ImageFormat) -> Result<Option<Vec<u8>>> {
+    let image_format = format
+        .to_image_format()
+        .expect("native formats map to image::ImageFormat");
+    let mut decoder = native_decoder(reader, image_format)?;
+    // A profile that fails to read is no profile, as in `probe_native`: the header was fine, so the image is.
+    Ok(decoder
+        .icc_profile()
+        .ok()
+        .flatten()
+        .and_then(|profile| usable_profile(&profile)))
+}
+
+/// The `image` crate's decoder for a native format, with its header parsed and no pixels decoded.
+///
+/// TIFF is built directly rather than through [`ImageReader`], whose limits hand the `tiff` crate a decoding buffer
+/// the size of the image's own pixels and nothing more. The `tiff` crate applies that same bound to every tag value it
+/// reads, so through `ImageReader` a profile larger than about a twenty-fourth of the pixel data (any profile at all,
+/// on a small image) fails to read and is reported as absent. Built directly, it keeps the `tiff` crate's own default
+/// bound of 256 MiB per value.
+fn native_decoder<'a, R: BufRead + Seek + 'a>(
+    reader: R,
+    format: ::image::ImageFormat,
+) -> Result<Box<dyn ImageDecoder + 'a>> {
+    if format == ::image::ImageFormat::Tiff {
+        return Ok(Box::new(TiffDecoder::new(reader)?));
+    }
+    Ok(Box::new(ImageReader::with_format(reader, format).into_decoder()?))
 }
 
 /// Maps the `avif` crate's bit-depth enum to bits per channel. Both enums are `#[non_exhaustive]`, so the
@@ -288,37 +351,61 @@ pub(super) fn make_compatible(image: &DynamicImage, format: ImageFormat) -> Opti
 /// handling in [`memo`](crate::memo) and [`o11y`](crate::o11y).
 static AVIF_ENCODE: Mutex<()> = Mutex::new(());
 
-/// Encodes `image` straight into `writer` using the codec selected by `options`.
+/// Encodes `image` straight into `writer` using the codec selected by `options`, embedding what `metadata` carries
+/// where the format can hold it, and reports what was embedded.
 ///
 /// Every codec here except BMP, GIF and TIFF takes a plain [`Write`], so the encoded bytes go to the destination as
-/// they are produced rather than being accumulated first. The three that go through
-/// [`DynamicImage::write_to`](::image::DynamicImage::write_to) need `Write + Seek`, so they are the only ones that
-/// buffer, into a `Cursor` of their own — which keeps that requirement from reaching the caller's sink.
-pub(super) fn encode_into<W: Write>(image: &DynamicImage, options: EncodeOptions, writer: &mut W) -> Result<()> {
+/// they are produced rather than being accumulated first. The three that need `Write + Seek` are the only ones that
+/// buffer, into a `Cursor` of their own — which keeps that requirement from reaching the caller's sink. WebP also
+/// buffers, but only when there is a profile to embed: its chunks are rewritten after libwebp has finished.
+///
+/// Embedding never fails the encode. A profile the format cannot hold, or one too large for it, is left out and
+/// reported `false` in the returned [`Embedded`].
+pub(super) fn encode_into<W: Write>(
+    image: &DynamicImage,
+    options: EncodeOptions,
+    metadata: &Metadata,
+    writer: &mut W,
+) -> Result<Embedded> {
     // Ahead of the `match`, so no codec below is reachable without it. See [`make_compatible`] for what it converts.
     let converted = make_compatible(image, options.format());
     let image = converted.as_ref().unwrap_or(image);
 
+    let profile = metadata.icc_profile.as_deref();
+    let mut embedded = Embedded::default();
+
     match options {
-        // These three need `Seek` as well, which a bare `Write` cannot offer, so they encode into a rewindable
-        // buffer and the bytes are handed on from there. Done inline rather than through a second entry point that
-        // called straight back into this one: the two were mutually recursive, and the compatibility step above had
-        // to be stated at both ends to cover whichever was entered first.
-        EncodeOptions::Bmp | EncodeOptions::Gif | EncodeOptions::Tiff => {
+        // These need `Seek` as well, which a bare `Write` cannot offer, so they encode into a rewindable buffer and
+        // the bytes are handed on from there. Done inline rather than through a second entry point that called
+        // straight back into this one: the two were mutually recursive, and the compatibility step above had to be
+        // stated at both ends to cover whichever was entered first.
+        EncodeOptions::Bmp | EncodeOptions::Gif => {
             let format = options
                 .format()
                 .to_image_format()
-                .expect("bmp, gif and tiff map to image::ImageFormat");
+                .expect("bmp and gif map to image::ImageFormat");
 
             let mut seekable = Cursor::new(Vec::new());
             image.write_to(&mut seekable, format)?;
             writer.write_all(&seekable.into_inner())?;
         }
+        // Through its encoder rather than `write_to`, which is the same encoder with no way to hand it a profile.
+        EncodeOptions::Tiff => {
+            let mut seekable = Cursor::new(Vec::new());
+            let mut encoder = TiffEncoder::new(&mut seekable);
+            embedded.icc_profile = offer_profile(&mut encoder, profile, usize::MAX);
+            image.write_with_encoder(encoder)?;
+            writer.write_all(&seekable.into_inner())?;
+        }
         EncodeOptions::Jpeg { quality } => {
-            image.write_with_encoder(JpegEncoder::new_with_quality(writer, quality))?;
+            let mut encoder = JpegEncoder::new_with_quality(writer, quality);
+            embedded.icc_profile = offer_profile(&mut encoder, profile, JPEG_MAX_ICC_PROFILE_LEN);
+            image.write_with_encoder(encoder)?;
         }
         EncodeOptions::Png { compression, filter } => {
-            image.write_with_encoder(PngEncoder::new_with_quality(writer, compression.into(), filter.into()))?;
+            let mut encoder = PngEncoder::new_with_quality(writer, compression.into(), filter.into());
+            embedded.icc_profile = offer_profile(&mut encoder, profile, usize::MAX);
+            image.write_with_encoder(encoder)?;
         }
         EncodeOptions::Avif {
             quality,
@@ -352,15 +439,49 @@ pub(super) fn encode_into<W: Write>(image: &DynamicImage, options: EncodeOptions
             lossless,
             threads,
         } => {
-            let encoder = ::webp::WebpEncoder::new(writer)
-                .with_quality(quality)
-                .with_quality_alpha(quality_alpha)
-                .with_compression(compression)
-                .with_lossless(lossless)
-                .with_threads(threads);
-            image.write_with_encoder(encoder)?;
+            fn encoder<S: Write>(sink: S, options: (u8, u8, u8, bool, bool)) -> ::webp::WebpEncoder<S> {
+                let (quality, quality_alpha, compression, lossless, threads) = options;
+                ::webp::WebpEncoder::new(sink)
+                    .with_quality(quality)
+                    .with_quality_alpha(quality_alpha)
+                    .with_compression(compression)
+                    .with_lossless(lossless)
+                    .with_threads(threads)
+            }
+            let settings = (quality, quality_alpha, compression, lossless, threads);
+            match profile.filter(|profile| profile.len() <= MAX_ICC_PROFILE_LEN) {
+                // Nothing to add, so nothing to rewrite: streamed exactly as before.
+                None => image.write_with_encoder(encoder(writer, settings))?,
+                Some(profile) => {
+                    let mut plain = Vec::new();
+                    image.write_with_encoder(encoder(&mut plain, settings))?;
+                    match riff::with_iccp(&plain, profile) {
+                        Some(tagged) => {
+                            writer.write_all(&tagged)?;
+                            embedded.icc_profile = true;
+                        }
+                        // The encoder's own output, written as it stands, rather than no file at all.
+                        None => writer.write_all(&plain)?,
+                    }
+                }
+            }
         }
     }
 
-    Ok(())
+    Ok(embedded)
+}
+
+/// The largest profile the `image` crate's JPEG encoder splits across `APP2` segments: 255 segments of 65,519 bytes.
+/// Larger, and it refuses the whole encode rather than the profile, so a profile over it is never handed to it.
+const JPEG_MAX_ICC_PROFILE_LEN: usize = 255 * (65_533 - 14);
+
+/// Hands `profile` to `encoder` if there is one no larger than `limit` (nor [`MAX_ICC_PROFILE_LEN`]), and answers
+/// whether the encoder took it.
+fn offer_profile(encoder: &mut impl ImageEncoder, profile: Option<&[u8]>, limit: usize) -> bool {
+    match profile {
+        Some(profile) if profile.len() <= limit.min(MAX_ICC_PROFILE_LEN) => {
+            encoder.set_icc_profile(profile.to_vec()).is_ok()
+        }
+        _ => false,
+    }
 }
