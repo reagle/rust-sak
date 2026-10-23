@@ -6,7 +6,7 @@
 //!   `ipma`. It holds either an ICC profile (`prof`/`rICC`) or CICP codes (`nclx`).
 
 use super::ImageFormat;
-use super::icc;
+use super::icc::{self, read_u32};
 
 /// The bytes ran out before the answer was found: the input is a prefix of the file, or a truncated file.
 #[derive(Debug, PartialEq, Eq)]
@@ -248,8 +248,4 @@ fn find<'a>(boxes: &[([u8; 4], &'a [u8])], kind: &[u8; 4]) -> Option<&'a [u8]> {
 
 fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_be_bytes(bytes.get(at..at.checked_add(2)?)?.try_into().ok()?))
-}
-
-fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(bytes.get(at..at.checked_add(4)?)?.try_into().ok()?))
 }

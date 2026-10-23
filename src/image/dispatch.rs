@@ -97,50 +97,42 @@ pub(super) fn decode_with_format(bytes: &[u8], format: ImageFormat) -> Result<Dy
 /// routing native formats through the `image` crate's streaming decoder and `avif`/`heif`/`webp` through their
 /// dedicated crates' `probe` helpers. Shared by every probe entry point.
 pub(super) fn probe_with_format(bytes: &[u8], format: ImageFormat) -> Result<ImageInfo> {
-    match format {
+    let mut info = probe_codec(bytes, format)?;
+    // `bytes` is taken to be the whole file, so running out of it means there is no profile to find.
+    if let Ok(Some(profile)) = container::color_profile(bytes, format) {
+        info.color_profile = Some(profile);
+    }
+    Ok(info)
+}
+
+/// [`probe_with_format`] without reading the `avif`/`heif`/`webp` color profile, which lives in the container rather
+/// than the codec's header and so is left `None` for the caller to fill in from [`container::color_profile`].
+pub(super) fn probe_codec(bytes: &[u8], format: ImageFormat) -> Result<ImageInfo> {
+    let (width, height, color_type, bit_depth) = match format {
         ImageFormat::Avif => {
             let info = ::avif::probe(bytes)?;
-            Ok(ImageInfo {
-                format,
-                width: info.width,
-                height: info.height,
-                color_type: info.color_type,
-                bit_depth: avif_bit_depth(info.bit_depth),
-                color_profile: container_profile(bytes, format),
-            })
+            (info.width, info.height, info.color_type, avif_bit_depth(info.bit_depth))
         }
         ImageFormat::Heif => {
             let info = ::heif::probe(bytes)?;
-            Ok(ImageInfo {
-                format,
-                width: info.width,
-                height: info.height,
-                color_type: info.color_type,
-                bit_depth: heif_bit_depth(info.bit_depth),
-                color_profile: container_profile(bytes, format),
-            })
+            (info.width, info.height, info.color_type, heif_bit_depth(info.bit_depth))
         }
         ImageFormat::WebP => {
             // WebP is always 8 bits per channel.
             let info = ::webp::probe(bytes)?;
-            Ok(ImageInfo {
-                format,
-                width: info.width,
-                height: info.height,
-                color_type: info.color_type,
-                bit_depth: 8,
-                color_profile: container_profile(bytes, format),
-            })
+            (info.width, info.height, info.color_type, 8)
         }
-        native => probe_native(Cursor::new(bytes), native),
-    }
-}
+        native => return probe_native(Cursor::new(bytes), native),
+    };
 
-/// The color profile the `avif`/`heif`/`webp` container in `bytes` declares. `bytes` is taken to be the whole file,
-/// so running out of it means there is no profile to find; [`probe_file`](super::probe_file), which may hold only a
-/// prefix, checks for that itself before trusting this.
-fn container_profile(bytes: &[u8], format: ImageFormat) -> Option<String> {
-    container::color_profile(bytes, format).unwrap_or_default()
+    Ok(ImageInfo {
+        format,
+        width,
+        height,
+        color_type,
+        bit_depth,
+        color_profile: None,
+    })
 }
 
 /// Reads the metadata of a native-format image from `reader` **without decoding the pixels**, pulling only as much

@@ -35,10 +35,6 @@ impl Store for FailingStore {
         Ok(())
     }
 
-    fn flush(&self) -> Result<()> {
-        Ok(())
-    }
-
     fn path(&self) -> Option<&Path> {
         None
     }

@@ -26,19 +26,15 @@
 //! segfault in whatever the process happens to be doing by then. So every library the probe caused to be loaded,
 //! the Vulkan loader included, is marked `RTLD_NODELETE` before the instance is destroyed.
 
-/// `VK_API_VERSION_1_1`, the oldest Vulkan version Dawn accepts a device at.
-pub(super) const VULKAN_1_1: u32 = (1 << 22) | (1 << 12);
-
 /// `VK_PHYSICAL_DEVICE_TYPE_CPU`, the type `lavapipe` and other software rasterisers report.
 pub(super) const DEVICE_TYPE_CPU: i32 = 4;
 
-/// Says whether any of `devices`, each an `(apiVersion, deviceType)` pair from `VkPhysicalDeviceProperties`, can run
-/// WebGPU: a device that is not a CPU and supports Vulkan 1.1 or newer.
-pub(super) fn supports_webgpu(devices: impl IntoIterator<Item = (u32, i32)>) -> bool {
-    // The top three bits are the API *variant*, which is 0 for Vulkan and would otherwise outweigh the version.
+/// Says whether any of `devices` can run WebGPU: a device that is not a CPU and supports Vulkan 1.1 or newer, the
+/// oldest version Dawn accepts a device at.
+pub(super) fn supports_webgpu(devices: &[VulkanDevice]) -> bool {
     devices
-        .into_iter()
-        .any(|(api_version, device_type)| device_type != DEVICE_TYPE_CPU && api_version & 0x1FFF_FFFF >= VULKAN_1_1)
+        .iter()
+        .any(|device| device.device_type != VulkanDeviceType::Cpu && device.api_version >= (1, 1, 0))
 }
 
 /// `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT`: a heap in the device's own memory rather than in system memory it can reach.
@@ -158,11 +154,7 @@ pub(super) fn device_from_parts(name: &[u8], api_version: u32, device_type: i32,
 pub fn vulkan_devices() -> Vec<VulkanDevice> {
     #[cfg(target_os = "linux")]
     {
-        imp::probe()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|probed| probed.device)
-            .collect()
+        imp::probe().unwrap_or_default()
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -202,13 +194,7 @@ pub fn is_webgpu_supported() -> bool {
 
     #[cfg(target_os = "linux")]
     {
-        imp::probe().is_some_and(|devices| {
-            supports_webgpu(
-                devices
-                    .iter()
-                    .map(|device| (device.raw_api_version, device.raw_device_type)),
-            )
-        })
+        imp::probe().is_some_and(|devices| supports_webgpu(&devices))
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -256,14 +242,6 @@ mod imp {
 
     /// `VK_MAX_PHYSICAL_DEVICE_NAME_SIZE`.
     const NAME_SIZE: usize = 256;
-
-    /// One device as read, with the two raw values [`supports_webgpu`](super::supports_webgpu) judges beside the
-    /// decoded device.
-    pub(super) struct Probed {
-        pub(super) device: VulkanDevice,
-        pub(super) raw_api_version: u32,
-        pub(super) raw_device_type: i32,
-    }
 
     /// `VkInstanceCreateInfo`. No application info is passed, which asks for Vulkan 1.0 — the one version every loader
     /// accepts. The version a *device* supports is reported regardless of the instance's.
@@ -332,7 +310,7 @@ mod imp {
     ///
     /// Every failure — no loader, no driver, an instance the loader refuses — is a `None`: a machine without Vulkan is
     /// exactly the case this exists to report.
-    pub(super) fn probe() -> Option<Vec<Probed>> {
+    pub(super) fn probe() -> Option<Vec<VulkanDevice>> {
         // Taken before the loader is opened, so the loader itself is among what gets pinned: dropping `library` below
         // would otherwise unload it, and every driver it holds with it.
         let before = loaded_objects();
@@ -351,7 +329,7 @@ mod imp {
     /// # Safety
     ///
     /// `library` must be the Vulkan loader.
-    unsafe fn devices(library: &Library, before: &HashSet<CString>) -> Option<Vec<Probed>> {
+    unsafe fn devices(library: &Library, before: &HashSet<CString>) -> Option<Vec<VulkanDevice>> {
         // SAFETY: `vkGetInstanceProcAddr` is the loader's one guaranteed export, with this signature.
         let get_proc: Symbol<GetInstanceProcAddr> = unsafe { library.get(b"vkGetInstanceProcAddr\0") }.ok()?;
 
@@ -402,7 +380,7 @@ mod imp {
     /// # Safety
     ///
     /// `instance` must be a live instance created through `get_proc`'s loader.
-    unsafe fn read_devices(get_proc: &Symbol<GetInstanceProcAddr>, instance: Instance) -> Option<Vec<Probed>> {
+    unsafe fn read_devices(get_proc: &Symbol<GetInstanceProcAddr>, instance: Instance) -> Option<Vec<VulkanDevice>> {
         // SAFETY: each name is looked up for a live instance, and cast to the signature `vulkan_core.h` declares.
         let (enumerate, properties, memory) = unsafe {
             let enumerate: EnumeratePhysicalDevices =
@@ -458,11 +436,7 @@ mod imp {
                     })
                     .unwrap_or_default();
 
-                Probed {
-                    device: device_from_parts(&header.device_name, header.api_version, header.device_type, &heaps),
-                    raw_api_version: header.api_version,
-                    raw_device_type: header.device_type,
-                }
+                device_from_parts(&header.device_name, header.api_version, header.device_type, &heaps)
             })
             .collect();
 

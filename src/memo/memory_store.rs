@@ -112,10 +112,6 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    fn flush(&self) -> Result<()> {
-        Ok(())
-    }
-
     fn path(&self) -> Option<&Path> {
         None
     }

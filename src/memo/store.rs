@@ -38,7 +38,9 @@ pub(super) trait Store: fmt::Debug + Send + Sync {
     fn cleanup(&self) -> Result<()>;
 
     /// Makes every write this store has deferred durable. Stores that defer nothing return `Ok(())`.
-    fn flush(&self) -> Result<()>;
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// The directory backing this store, or `None` for one that keeps nothing on disk.
     fn path(&self) -> Option<&Path>;

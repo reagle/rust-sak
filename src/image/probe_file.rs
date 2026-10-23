@@ -4,7 +4,7 @@ use std::path::Path;
 
 use super::ImageFormat;
 use super::container;
-use super::dispatch::{probe_native, probe_with_format};
+use super::dispatch::{probe_codec, probe_native, probe_with_format};
 use super::error::{ImageError, Result};
 use super::info::ImageInfo;
 
@@ -51,14 +51,26 @@ pub fn probe_file(path: impl AsRef<Path>) -> Result<ImageInfo> {
 
     // A prefix shorter than the cap is the whole file, so there is nothing left to fall back to.
     let is_whole_file = (prefix.len() as u64) < HEADER_PREFIX;
-    match probe_with_format(&prefix, format) {
-        // The codec's header fits more often than the color profile does: a large `meta` box, or a WebP with a big
-        // EXIF chunk ahead of `ICCP`, can push the profile past the prefix even when the dimensions were found.
-        Ok(info) if is_whole_file || container::color_profile(&prefix, format).is_ok() => Ok(info),
+    match probe_codec(&prefix, format) {
+        Ok(mut info) => {
+            info.color_profile = match container::color_profile(&prefix, format) {
+                Ok(profile) => profile,
+                Err(_) if is_whole_file => None,
+                // The codec's header fits more often than the color profile does: a large `meta` box, or a WebP with
+                // a big EXIF chunk ahead of `ICCP`, can push the profile past the prefix even when the dimensions were
+                // found. Only the profile is read again, from the whole file.
+                Err(_) => {
+                    let mut bytes = prefix;
+                    file.read_to_end(&mut bytes)?;
+                    container::color_profile(&bytes, format).unwrap_or_default()
+                }
+            };
+            Ok(info)
+        }
         Err(err) if is_whole_file => Err(err),
         // The prefix was not enough. Re-read the file whole and let its error, if any, be the one reported: it comes
         // from complete input and so describes the actual problem.
-        _ => {
+        Err(_) => {
             let mut bytes = prefix;
             file.read_to_end(&mut bytes)?;
             probe_with_format(&bytes, format)

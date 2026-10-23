@@ -92,16 +92,7 @@ impl ImageFormat {
 
     /// The canonical lowercase file extension for this format (without a leading dot).
     pub fn extension(self) -> &'static str {
-        match self {
-            ImageFormat::Bmp => "bmp",
-            ImageFormat::Gif => "gif",
-            ImageFormat::Jpeg => "jpg",
-            ImageFormat::Png => "png",
-            ImageFormat::Tiff => "tiff",
-            ImageFormat::Avif => "avif",
-            ImageFormat::Heif => "heif",
-            ImageFormat::WebP => "webp",
-        }
+        self.extensions()[0]
     }
 
     /// Every lowercase file extension (without a leading dot) that selects this format; the first is

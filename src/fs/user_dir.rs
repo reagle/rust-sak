@@ -21,12 +21,8 @@ const DIR_MODE: u32 = 0o755;
 /// Returns [`FsError::EmptyName`] if `name` is empty, or [`FsError::IllegalPath`] if either part is not a contained
 /// relative path.
 pub(super) fn user_path(root: &Path, name: &str, sub_path: &Path) -> Result<PathBuf> {
-    if name.is_empty() {
-        return Err(FsError::EmptyName);
-    }
-
-    // A name of `.` or `./` passes validation but names no directory at all, which would silently hand back the
-    // bare root — the same mistake an empty name makes, so it earns the same error.
+    // An empty name, or one of only `.` and separators, passes validation but names no directory at all, which would
+    // silently hand back the bare root.
     let name_components = validate_entry_name(name)?;
     if name_components.is_empty() {
         return Err(FsError::EmptyName);

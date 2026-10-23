@@ -15,7 +15,7 @@ use super::gpu_sysfs::{
 use super::pci_ids::{lookup_pci_ids, read_pci_ids_from};
 use super::vendor::{gpu_from_driver, vendor_from_description, vendor_name};
 use super::webgpu::{
-    DEVICE_TYPE_CPU, HEAP_DEVICE_LOCAL, VULKAN_1_1, VulkanDeviceType, api_version_parts,
+    DEVICE_TYPE_CPU, HEAP_DEVICE_LOCAL, VulkanDevice, VulkanDeviceType, api_version_parts,
     device_from_parts as vulkan_device_from_parts, supports_webgpu,
 };
 use super::*;
@@ -722,16 +722,17 @@ fn gpu_from_properties_drops_an_entry_with_no_model() {
 
 // --- nvml tests ---
 
-/// Encodes a name the way `nvmlDeviceGetName` writes one: NUL-terminated, padded to the 96-byte buffer.
-fn nvml_name(name: &str) -> Vec<u8> {
-    let mut buffer = name.as_bytes().to_vec();
-    buffer.resize(96, 0);
+/// Encodes a name the way `nvmlDeviceGetName` and Vulkan's `deviceName` hold one: NUL-terminated, padded to the
+/// `N`-byte buffer.
+fn nul_padded<const N: usize>(name: &str) -> [u8; N] {
+    let mut buffer = [0_u8; N];
+    buffer[..name.len()].copy_from_slice(name.as_bytes());
     buffer
 }
 
 #[test]
 fn device_name_stops_at_the_first_nul() {
-    let mut buffer = nvml_name("NVIDIA GeForce RTX 5090");
+    let mut buffer = nul_padded::<96>("NVIDIA GeForce RTX 5090");
     // The tail past the terminator is whatever the buffer held before the call.
     buffer[80] = b'X';
 
@@ -862,34 +863,46 @@ const INTEGRATED: i32 = 1;
 const DISCRETE: i32 = 2;
 const VIRTUAL: i32 = 3;
 
-/// `VK_API_VERSION_1_0` and `VK_API_VERSION_1_3`.
+/// `VK_API_VERSION_1_0`, `VK_API_VERSION_1_1` and `VK_API_VERSION_1_3`.
 const VULKAN_1_0: u32 = 1 << 22;
+const VULKAN_1_1: u32 = (1 << 22) | (1 << 12);
 const VULKAN_1_3: u32 = (1 << 22) | (3 << 12);
+
+/// Devices as the driver would report them, from `(apiVersion, deviceType)` pairs.
+fn devices<const N: usize>(pairs: [(u32, i32); N]) -> Vec<VulkanDevice> {
+    pairs
+        .into_iter()
+        .map(|(api_version, device_type)| vulkan_device_from_parts(&[], api_version, device_type, &[]))
+        .collect()
+}
 
 #[test]
 fn supports_webgpu_is_false_without_any_device() {
-    assert!(!supports_webgpu([]));
+    assert!(!supports_webgpu(&[]));
 }
 
 #[test]
 fn supports_webgpu_does_not_count_a_cpu_rasteriser() {
-    assert!(!supports_webgpu([(VULKAN_1_3, DEVICE_TYPE_CPU)]));
+    assert!(!supports_webgpu(&devices([(VULKAN_1_3, DEVICE_TYPE_CPU)])));
 }
 
 #[test]
 fn supports_webgpu_does_not_count_a_vulkan_1_0_gpu() {
-    assert!(!supports_webgpu([(VULKAN_1_0, DISCRETE), (VULKAN_1_1 - 1, INTEGRATED)]));
+    assert!(!supports_webgpu(&devices([
+        (VULKAN_1_0, DISCRETE),
+        (VULKAN_1_1 - 1, INTEGRATED)
+    ])));
 }
 
 #[test]
 fn supports_webgpu_counts_any_vulkan_1_1_gpu() {
     for device_type in [INTEGRATED, DISCRETE, VIRTUAL] {
         assert!(
-            supports_webgpu([(VULKAN_1_1, device_type)]),
+            supports_webgpu(&devices([(VULKAN_1_1, device_type)])),
             "device type {device_type}"
         );
         assert!(
-            supports_webgpu([(VULKAN_1_3, device_type)]),
+            supports_webgpu(&devices([(VULKAN_1_3, device_type)])),
             "device type {device_type}"
         );
     }
@@ -897,30 +910,23 @@ fn supports_webgpu_counts_any_vulkan_1_1_gpu() {
 
 #[test]
 fn supports_webgpu_counts_a_gpu_listed_beside_a_cpu_rasteriser() {
-    assert!(supports_webgpu([
+    assert!(supports_webgpu(&devices([
         (VULKAN_1_3, DEVICE_TYPE_CPU),
         (VULKAN_1_1, INTEGRATED)
-    ]));
+    ])));
 }
 
 #[test]
 fn supports_webgpu_ignores_the_api_variant_bits() {
     // A non-Vulkan variant sets the top bits, which must not stand in for a newer version.
-    assert!(!supports_webgpu([((1 << 29) | VULKAN_1_0, DISCRETE)]));
-}
-
-/// What `deviceName` holds: the name, NUL-terminated, then padding.
-fn device_name_buffer(name: &str) -> [u8; 256] {
-    let mut buffer = [0_u8; 256];
-    buffer[..name.len()].copy_from_slice(name.as_bytes());
-    buffer
+    assert!(!supports_webgpu(&devices([((1 << 29) | VULKAN_1_0, DISCRETE)])));
 }
 
 #[test]
 fn a_vulkan_device_counts_only_its_device_local_heaps() {
     // An Arc B580 as Mesa's ANV reports it: 12 GiB of VRAM, plus the system memory it can reach.
     let device = vulkan_device_from_parts(
-        &device_name_buffer("Intel(R) Graphics (BMG G21)"),
+        &nul_padded::<256>("Intel(R) Graphics (BMG G21)"),
         VULKAN_1_3 | 290,
         DISCRETE,
         &[(12 << 30, HEAP_DEVICE_LOCAL), (16 << 30, 0)],
@@ -940,7 +946,7 @@ fn a_vulkan_device_adds_up_several_device_local_heaps() {
         (15 << 30, 0),
     ];
     let device = vulkan_device_from_parts(
-        &device_name_buffer("AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO)"),
+        &nul_padded::<256>("AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO)"),
         VULKAN_1_3,
         INTEGRATED,
         &heaps,
@@ -953,7 +959,7 @@ fn a_vulkan_device_adds_up_several_device_local_heaps() {
 #[test]
 fn a_vulkan_device_with_no_device_local_heap_reports_no_memory() {
     let lavapipe = vulkan_device_from_parts(
-        &device_name_buffer("llvmpipe (LLVM 19.1.7, 256 bits)"),
+        &nul_padded::<256>("llvmpipe (LLVM 19.1.7, 256 bits)"),
         VULKAN_1_3,
         DEVICE_TYPE_CPU,
         &[(32 << 30, 0)],
@@ -962,7 +968,7 @@ fn a_vulkan_device_with_no_device_local_heap_reports_no_memory() {
     assert_eq!(lavapipe.device_local_memory, None);
 
     assert_eq!(
-        vulkan_device_from_parts(&device_name_buffer("x"), VULKAN_1_3, DISCRETE, &[]).device_local_memory,
+        vulkan_device_from_parts(&nul_padded::<256>("x"), VULKAN_1_3, DISCRETE, &[]).device_local_memory,
         None
     );
 }

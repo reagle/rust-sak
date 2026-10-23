@@ -83,7 +83,7 @@ fn multi_localized(data: &[u8]) -> Option<String> {
     Some(String::from_utf16_lossy(&units))
 }
 
-fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+pub(super) fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
     let slice = bytes.get(at..at.checked_add(4)?)?;
     Some(u32::from_be_bytes(slice.try_into().ok()?))
 }

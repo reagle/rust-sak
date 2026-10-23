@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -59,25 +59,25 @@ pub(super) struct DiskStore {
     /// the compaction itself. Behind an [`Option`] so [`Drop`] can close it while still holding [`OPEN`], which is
     /// what stops a re-open from racing the file lock this store has not released yet.
     db: RwLock<Option<Database>>,
-    /// The canonicalized directory holding the database, for [`Store::path`].
-    directory: PathBuf,
-    /// The database file inside [`directory`](Self::directory): this store's key in [`OPEN`].
+    /// The database file, in its canonicalized directory: this store's key in [`OPEN`], and its parent is
+    /// [`Store::path`].
     file: PathBuf,
     /// This store's [`GENERATION`] stamp.
     generation: u64,
     /// Held for the length of a sweep, so only one runs at a time.
     sweeping: AtomicBool,
     /// Which writes are made durable, and how many are waiting to be.
-    cadence: Cadence,
+    ///
+    /// A write takes it before beginning its transaction and holds it through the commit, so deciding a write's
+    /// durability and recording the outcome see no other write in between. redb grants its write transaction to one
+    /// caller at a time anyway, so this costs no concurrency.
+    cadence: Mutex<Cadence>,
 }
 
 /// Decides which writes commit durably, from [`CacheOpts::flush_every`] and [`CacheOpts::flush_interval`].
 ///
 /// Every write commits, so it is readable at once, but only a durable commit forces it to disk — and redb's durable
-/// commit persists every non-durable one before it. The fields are only read and updated with the database's write
-/// transaction held - and before it commits, since committing releases it to the next writer - which redb grants to
-/// one caller at a time, so exactly one write per window is the durable one. They are atomics only because the store
-/// is shared across threads.
+/// commit persists every non-durable one before it.
 #[derive(Debug)]
 struct Cadence {
     /// Make a write durable once this many have been committed since the last durable one. Never zero.
@@ -85,74 +85,41 @@ struct Cadence {
     /// Also make a write durable once this long has passed since the last durable one. Zero means never.
     interval: Duration,
     /// The writes committed since the last durable commit.
-    pending: AtomicU32,
-    /// When the last durable commit landed, in nanoseconds since [`epoch`](Self::epoch).
-    last_durable: AtomicU64,
-    /// The reference point for [`last_durable`](Self::last_durable): monotonic, so a clock jump cannot fire a flush.
-    epoch: Instant,
+    pending: u32,
+    /// When the last durable commit landed. Monotonic, so a clock jump cannot fire a flush.
+    last_durable: Instant,
     /// How many writes have committed durably. Test-only.
     #[cfg(test)]
-    durable_writes: AtomicU64,
+    durable_writes: u64,
 }
 
 impl Cadence {
     fn new(opts: CacheOpts) -> Self {
         Cadence {
-            every: opts.flush_every.max(1),
+            every: opts.flush_every,
             interval: opts.flush_interval,
-            pending: AtomicU32::new(0),
-            last_durable: AtomicU64::new(0),
-            epoch: Instant::now(),
+            pending: 0,
+            last_durable: Instant::now(),
             #[cfg(test)]
-            durable_writes: AtomicU64::new(0),
+            durable_writes: 0,
         }
     }
 
-    /// Counts the write about to commit and reports whether it must be durable.
-    ///
-    /// Call it holding the write transaction and before committing: once the commit releases the transaction, the
-    /// next writer must already see this write counted. If a durable commit then fails, call [`Cadence::failed`].
+    /// Whether the next write must be durable.
     fn next_is_durable(&self) -> bool {
-        let pending = self.pending.load(Ordering::Acquire).saturating_add(1);
-        let due = pending >= self.every
-            || (!self.interval.is_zero() && self.elapsed().saturating_sub(self.last_durable()) >= self.interval);
+        self.pending.saturating_add(1) >= self.every
+            || (!self.interval.is_zero() && self.last_durable.elapsed() >= self.interval)
+    }
 
-        if due {
-            self.durable();
+    /// Records a commit that succeeded. A durable one persists every write before it. Nothing is recorded for a
+    /// commit that failed, so the writes it was meant to persist stay pending.
+    fn committed(&mut self, durable: bool) {
+        if durable {
+            self.pending = 0;
+            self.last_durable = Instant::now();
         } else {
-            self.pending.store(pending, Ordering::Release);
+            self.pending = self.pending.saturating_add(1);
         }
-
-        due
-    }
-
-    /// Whether any committed write is still waiting to be made durable.
-    fn has_pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire) > 0
-    }
-
-    /// Records the durable commit about to happen, which persists every write before it. Call it as
-    /// [`Cadence::next_is_durable`] is called.
-    fn durable(&self) {
-        let now = u64::try_from(self.elapsed().as_nanos()).unwrap_or(u64::MAX);
-
-        self.last_durable.store(now, Ordering::Release);
-        self.pending.store(0, Ordering::Release);
-    }
-
-    /// Undoes [`Cadence::durable`] after the durable commit failed, so the writes it was meant to persist are still
-    /// pending and the next write is the durable one.
-    fn failed(&self) {
-        self.pending
-            .fetch_max(self.every.saturating_sub(1).max(1), Ordering::AcqRel);
-    }
-
-    fn elapsed(&self) -> Duration {
-        self.epoch.elapsed()
-    }
-
-    fn last_durable(&self) -> Duration {
-        Duration::from_nanos(self.last_durable.load(Ordering::Acquire))
     }
 }
 
@@ -196,7 +163,7 @@ impl DiskStore {
             // Deliberately *not* holding OPEN here. A store whose last handle has just gone still holds the file
             // lock until its `Drop` reaches OPEN, and that `Drop` cannot make progress while we hold it.
             match builder.create(&file) {
-                Ok(db) => return Ok(DiskStore::register(directory, file, db, opts)),
+                Ok(db) => return Ok(DiskStore::register(file, db, opts)),
                 // Either a teardown is still in flight, in which case waiting resolves it, or another process holds
                 // the file, in which case the attempts run out and the caller gets a truthful error.
                 Err(redb::DatabaseError::DatabaseAlreadyOpen) if attempt + 1 < OPEN_ATTEMPTS => {
@@ -229,7 +196,7 @@ impl DiskStore {
     }
 
     /// Registers `db` as the store for `file`, or discards it if another caller got there first.
-    fn register(directory: PathBuf, file: PathBuf, db: Database, opts: CacheOpts) -> Arc<DiskStore> {
+    fn register(file: PathBuf, db: Database, opts: CacheOpts) -> Arc<DiskStore> {
         let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
 
         // Someone may have finished opening this path while we were opening it too.
@@ -242,11 +209,10 @@ impl DiskStore {
         let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
         let store = Arc::new(DiskStore {
             db: RwLock::new(Some(db)),
-            directory,
             file: file.clone(),
             generation,
             sweeping: AtomicBool::new(false),
-            cadence: Cadence::new(opts),
+            cadence: Mutex::new(Cadence::new(opts)),
         });
 
         open.insert(file, (generation, Arc::downgrade(&store)));
@@ -352,30 +318,23 @@ impl Store for DiskStore {
         record.extend_from_slice(&value);
 
         let db = self.db.read().unwrap_or_else(PoisonError::into_inner);
+        let mut cadence = self.cadence();
         let mut txn = DiskStore::database(&db).begin_write()?;
         {
             let mut table = txn.open_table(ENTRIES)?;
             table.insert(key, record.as_slice())?;
         }
 
-        // Counted with the write transaction held, so no other write can slip into this window.
-        let durable = self.cadence.next_is_durable();
-        if !durable && let Err(err) = txn.set_durability(Durability::None) {
-            // Nothing committed, so this write must not stay counted; a durable write next is harmless.
-            self.cadence.failed();
-            return Err(err.into());
+        let durable = cadence.next_is_durable();
+        if !durable {
+            txn.set_durability(Durability::None)?;
         }
-
-        if let Err(err) = txn.commit() {
-            if durable {
-                self.cadence.failed();
-            }
-            return Err(err.into());
-        }
+        txn.commit()?;
+        cadence.committed(durable);
 
         #[cfg(test)]
         if durable {
-            self.cadence.durable_writes.fetch_add(1, Ordering::Relaxed);
+            cadence.durable_writes += 1;
         }
 
         Ok(())
@@ -383,7 +342,7 @@ impl Store for DiskStore {
 
     fn flush(&self) -> Result<()> {
         let db = self.db.read().unwrap_or_else(PoisonError::into_inner);
-        DiskStore::flush_into(DiskStore::database(&db), &self.cadence)
+        DiskStore::flush_into(DiskStore::database(&db), &mut self.cadence())
     }
 
     fn cleanup(&self) -> Result<()> {
@@ -402,7 +361,7 @@ impl Store for DiskStore {
     }
 
     fn path(&self) -> Option<&Path> {
-        Some(&self.directory)
+        self.file.parent()
     }
 }
 
@@ -411,23 +370,19 @@ impl DiskStore {
     ///
     /// Takes the database and the cadence apart rather than `&self`, so [`Drop`] can call it on the database it has
     /// exclusive access to.
-    fn flush_into(db: &Database, cadence: &Cadence) -> Result<()> {
-        let txn = db.begin_write()?;
-
-        // Checked and reset with the write transaction held, so a concurrent write is either counted here or not
-        // started, and is never counted after the reset only to be wiped by it.
-        if !cadence.has_pending() {
-            txn.abort()?;
+    fn flush_into(db: &Database, cadence: &mut Cadence) -> Result<()> {
+        if cadence.pending == 0 {
             return Ok(());
         }
 
-        cadence.durable();
-        if let Err(err) = txn.commit() {
-            cadence.failed();
-            return Err(err.into());
-        }
-
+        db.begin_write()?.commit()?;
+        cadence.committed(true);
         Ok(())
+    }
+
+    /// Locks the cadence until the guard drops, as the field documents.
+    fn cadence(&self) -> MutexGuard<'_, Cadence> {
+        self.cadence.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Deletes expired entries, then compacts so the space they held is actually returned to the filesystem.
@@ -482,12 +437,12 @@ impl DiskStore {
 impl DiskStore {
     /// How many writes have committed durably. Test-only.
     pub(super) fn durable_writes(&self) -> u64 {
-        self.cadence.durable_writes.load(Ordering::Relaxed)
+        self.cadence().durable_writes
     }
 
     /// Whether any committed write is still waiting to be made durable. Test-only.
     pub(super) fn has_deferred(&self) -> bool {
-        self.cadence.has_pending()
+        self.cadence().pending > 0
     }
 
     /// How many records the table physically holds, expired ones included. Test-only.
@@ -507,8 +462,9 @@ impl Drop for DiskStore {
     fn drop(&mut self) {
         // Persist what the cadence deferred, before taking the registry so a slow fsync does not hold up other
         // opens. `Drop` cannot report a failure, and redb recovers to the last durable commit regardless.
+        let cadence = self.cadence.get_mut().unwrap_or_else(PoisonError::into_inner);
         if let Some(db) = self.db.get_mut().unwrap_or_else(PoisonError::into_inner).as_ref() {
-            let _ = DiskStore::flush_into(db, &self.cadence);
+            let _ = DiskStore::flush_into(db, cadence);
         }
 
         let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);

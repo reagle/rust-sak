@@ -734,11 +734,7 @@ mod color_profile {
             let info = probe_bytes(&bytes).unwrap();
             assert_eq!(info.color_profile.as_deref(), Some("Display P3"), "format {format:?}");
 
-            let path = std::env::temp_dir().join(format!("rust_sak_icc_{}.{}", std::process::id(), format.extension()));
-            std::fs::write(&path, &bytes).unwrap();
-            let from_file = probe_file(&path);
-            std::fs::remove_file(&path).unwrap();
-            assert_eq!(from_file.unwrap(), info, "format {format:?}");
+            assert_eq!(probe_via_file(&bytes, format), info, "format {format:?}");
         }
     }
 

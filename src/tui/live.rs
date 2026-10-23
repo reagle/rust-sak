@@ -1,6 +1,6 @@
 use std::fmt;
-use std::io::{self, ErrorKind, IsTerminal, Stderr, Stdout, Write};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::io::{self, BufWriter, ErrorKind, IsTerminal, Stderr, Stdout, Write};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -40,14 +40,16 @@ impl Target {
     fn stream(self) -> Stream {
         match self {
             Self::Stdout => Stream::Stdout(io::stdout()),
-            Self::Stderr => Stream::Stderr(io::stderr()),
+            Self::Stderr => Stream::Stderr(BufWriter::new(io::stderr())),
         }
     }
 }
 
+/// The target stream, buffered so a frame goes out in one write: stdout already is, but stderr is not, and drawing a
+/// frame takes a separate write for every escape sequence. ratatui flushes after each frame.
 enum Stream {
     Stdout(Stdout),
-    Stderr(Stderr),
+    Stderr(BufWriter<Stderr>),
 }
 
 impl Write for Stream {
@@ -153,15 +155,11 @@ impl<L: LiveLine> Live<L> {
     ///
     /// Resumes the panic if [`LiveLine::render`] panicked; the terminal has been restored by then.
     pub fn finish(mut self) -> io::Result<()> {
-        self.stop(self.settle_cap)
-    }
-
-    fn stop(&mut self, cap: Duration) -> io::Result<()> {
         let Some(thread) = self.thread.take() else {
             return Ok(());
         };
         // A failed send means the frame thread has already ended, on an error that `join` returns.
-        let _ = self.finish.send(Stop::Settle(cap));
+        let _ = self.finish.send(Stop::Settle(self.settle_cap));
         thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 }
@@ -232,8 +230,8 @@ fn lock<L>(line: &Mutex<L>) -> MutexGuard<'_, L> {
     line.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The frame loop: draws `line` every frame and reports Ctrl-C, until `finish` delivers a settle cap (or is dropped)
-/// and the line settles or runs out of it, or until `finish` says to abandon it.
+/// The frame loop: draws `line` every frame and reports Ctrl-C, until `finish` delivers a settle cap and the line
+/// settles or runs out of it, or until `finish` says to abandon it.
 fn run<L: LiveLine>(
     mut session: Session,
     line: &Mutex<L>,
@@ -249,8 +247,8 @@ fn run<L: LiveLine>(
             match finish.try_recv() {
                 Ok(Stop::Settle(cap)) => finishing = Some((frame_started, cap)),
                 Ok(Stop::Abandon) => return Ok(()),
-                Err(TryRecvError::Disconnected) => finishing = Some((frame_started, Duration::ZERO)),
-                Err(TryRecvError::Empty) => {}
+                // `Live` holds the sender until it has joined this thread, so it is never disconnected.
+                Err(_) => {}
             }
         }
 
