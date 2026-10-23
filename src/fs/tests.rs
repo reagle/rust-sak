@@ -411,10 +411,23 @@ fn user_path_rejects_an_absolute_sub_path() {
 #[test]
 fn user_config_dir_lands_under_the_platform_config_directory() {
     // The only test that touches the real location — and it computes a path without creating anything.
+    #[cfg(target_os = "windows")]
+    let expected = dirs::data_local_dir().expect("platform should have a local data dir");
+    #[cfg(not(target_os = "windows"))]
     let expected = dirs::config_dir().expect("platform should have a config dir");
 
     let path = user_config_dir("rust-sak-test", "themes").unwrap();
     assert_eq!(path, expected.join("rust-sak-test").join("themes"));
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn config_root_is_the_platform_config_directory_outside_windows() {
+    // Only Windows moved to the local application data folder; Linux and macOS keep `dirs::config_dir()`.
+    assert_eq!(
+        super::user_config_dir::config_root().unwrap(),
+        dirs::config_dir().expect("platform should have a config dir")
+    );
 }
 
 #[test]

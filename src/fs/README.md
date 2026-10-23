@@ -39,7 +39,7 @@ Both are this crate's own types, wrapping [`tempfile`](https://crates.io/crates/
 | `user_documents_dir`    | `fn user_documents_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>`    | Computes the path. **No I/O.**                        |
 | `mk_user_documents_dir` | `fn mk_user_documents_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>` | Creates it (mode `0o755`) and returns the path.       |
 
-The config path is `<platform config dir>/<name>/<sub_path>` — `~/.config/…` on Linux, `~/Library/Application Support/…` on macOS, `%APPDATA%\…` on Windows. `mk_user_config_file` **does not truncate**, so an existing config survives being opened.
+The config path is `<platform config dir>/<name>/<sub_path>` — `~/.config/…` on Linux, `~/Library/Application Support/…` on macOS, `%LOCALAPPDATA%\…` on Windows. Windows uses the local application data folder because it does not roam with the user's profile, so large files kept there stay on the machine. `mk_user_config_file` **does not truncate**, so an existing config survives being opened.
 
 The documents path is `<documents dir>/<name>/<sub_path>` — `~/Documents/…` on macOS and Windows, the XDG documents directory on Linux. A platform without one (Linux with no XDG user directories, a Windows profile with no Documents known folder) returns `NoDocumentsDir`, so the caller can fall back somewhere deliberate.
 

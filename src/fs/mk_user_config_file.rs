@@ -13,6 +13,9 @@ const FILE_MODE: u32 = 0o644;
 
 /// Creates (if needed) and opens a file inside an application's configuration directory, for reading and writing.
 ///
+/// The application's directory is the one [`user_config_dir`](super::user_config_dir) computes: on Windows it is under
+/// `%LOCALAPPDATA%`, which does not roam with the user's profile.
+///
 /// `file_path` is a relative path within the application's directory, so `"config.toml"` and `"themes/dark.toml"`
 /// both work — any missing parent directories are created with mode `0o755`. The file itself is created with mode
 /// `0o644` on Unix.

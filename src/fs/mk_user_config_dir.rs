@@ -6,7 +6,8 @@ use super::user_dir::mk_user_dir_at;
 
 /// Creates an application's configuration directory, including any missing parents, and returns its path.
 ///
-/// The path is [`user_config_dir`](super::user_config_dir) computes, so the same validation applies. Directories are
+/// The path is [`user_config_dir`](super::user_config_dir) computes, so the same validation applies and the same root:
+/// `%LOCALAPPDATA%` on Windows, which does not roam with the user's profile. Directories are
 /// created with mode `0o755` on Unix. Succeeds silently if the directory already exists, and leaves an existing
 /// directory's mode alone.
 ///
