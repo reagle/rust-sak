@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::io;
 use std::path::Path;
 
 use sevenz_rust2::{ArchiveReader, Password};
@@ -39,7 +40,9 @@ pub fn un7zip(
     let files = &reader.archive().files;
     let totals = Totals {
         entries: Some(files.len() as u64),
-        bytes: Some(files.iter().map(|file| file.size).sum()),
+        // The sizes are the archive's claim, so their sum is checked: a header built to overflow it gets no total
+        // rather than a wrapped one.
+        bytes: files.iter().try_fold(0u64, |sum, file| sum.checked_add(file.size)),
     };
     let mut extractor = Extractor::new(target_dir.as_ref(), options, totals)?;
 
@@ -62,7 +65,15 @@ pub fn un7zip(
             link_target: None,
         };
 
-        match extractor.visit(raw, data) {
+        // In a solid archive every entry is a window onto one shared decoder stream, and `sevenz-rust2` does not skip
+        // what a window leaves unread — so a skipped entry, or a link whose target was read only partly, would shift
+        // every later entry onto the wrong bytes. Draining the rest keeps the stream aligned; it costs decompression
+        // time, never disk or memory.
+        let visited = extractor
+            .visit(raw, &mut *data)
+            .and_then(|()| Ok(io::copy(data, &mut io::sink()).map(drop)?));
+
+        match visited {
             Ok(()) => Ok(true),
             Err(err) => {
                 failure = Some(err);

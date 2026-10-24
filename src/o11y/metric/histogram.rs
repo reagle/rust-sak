@@ -115,12 +115,17 @@ impl Buckets {
 
     /// Reads the series into an exportable point. The bucket bounds are the enclosing instrument's, so they are
     /// recorded once beside the points rather than copied into each one.
+    ///
+    /// The count is the sum of the buckets as read, not the separate counter: a `record` landing between the two
+    /// loads would otherwise leave them disagreeing, and OTLP requires `count` to equal the bucket total.
     fn snapshot(&self, tags: Tags) -> HistogramPoint {
+        let bucket_counts: Vec<u64> = self.counts.iter().map(|count| count.load(Ordering::Relaxed)).collect();
+
         HistogramPoint {
             tags,
-            count: self.count.load(Ordering::Relaxed),
+            count: bucket_counts.iter().sum(),
             sum: f64::from_bits(self.sum.load(Ordering::Relaxed)),
-            bucket_counts: self.counts.iter().map(|count| count.load(Ordering::Relaxed)).collect(),
+            bucket_counts,
         }
     }
 }
@@ -147,9 +152,13 @@ impl Histogram {
     /// far. Ignoring the later call is what keeps the `LazyLock` pattern safe — two `static`s naming one metric with
     /// different bounds is a bug, but it must not be a panic inside a lazy initialiser.
     #[must_use = "with_buckets returns the configured histogram rather than modifying in place"]
+    ///
+    /// NaN and infinite bounds are dropped, and duplicates collapsed: OTLP requires the bounds to be finite and
+    /// strictly increasing, and the implicit last bucket already covers everything above the highest one.
     pub fn with_buckets(self, bounds: &[f64]) -> Self {
-        let mut sorted = bounds.to_vec();
+        let mut sorted: Vec<f64> = bounds.iter().copied().filter(|bound| bound.is_finite()).collect();
         sorted.sort_by(f64::total_cmp);
+        sorted.dedup();
 
         let _ = self.state.layout.set(Layout::new(sorted.into_boxed_slice()));
 
@@ -157,7 +166,14 @@ impl Histogram {
     }
 
     /// Files `value` into the untagged series.
+    ///
+    /// A NaN or infinite value is ignored: it has no bucket, and folded into the sum it would make that sum
+    /// meaningless for the rest of the process's life.
     pub fn record(&self, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+
         let layout = self.layout();
         layout.untagged.record(&layout.bounds, value);
     }
@@ -165,6 +181,10 @@ impl Histogram {
     /// Files `value` into the series identified by `tags`. See
     /// [`Counter::add_with_tags`](super::Counter::add_with_tags) for how tag sets are matched and capped.
     pub fn record_with_tags(&self, value: f64, tags: &[(&str, &str)]) {
+        if !value.is_finite() {
+            return;
+        }
+
         let layout = self.layout();
         let bound_count = layout.bounds.len();
 

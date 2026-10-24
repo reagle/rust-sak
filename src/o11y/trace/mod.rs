@@ -51,6 +51,16 @@ pub use span_context::SpanContext;
 /// Wraps a function body in a span named after the function, capturing its arguments as fields.
 ///
 /// See [the macro's own documentation](o11y_macros::instrument) for its options.
+///
+/// A `skip` naming no parameter is a compile error rather than a no-op, so a misspelt name cannot leave the argument it
+/// meant to hide captured:
+///
+/// ```compile_fail
+/// use rust_sak::o11y::trace;
+///
+/// #[trace::instrument(skip(pasword))]
+/// fn sign_in(user: &str, password: &str) {}
+/// ```
 pub use o11y_macros::instrument;
 
 #[doc(inline)]

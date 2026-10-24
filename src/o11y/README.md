@@ -80,7 +80,7 @@ Pass `NO_HEADERS` when there is none. Everything else has a default.
 | `.environment(..)`         | `Development`       | `deployment.environment.name`.                                                           |
 | `.min_level(..)`           | `Level::Info`       | The lowest severity recorded. Below it, a log macro evaluates nothing.                   |
 | `.header(k, v)`            | none                | One more header, on top of those passed to `builder`.                                    |
-| `.flush_interval(..)`      | `5s`                | How often the worker exports.                                                            |
+| `.flush_interval(..)`      | `5s`                | How often the worker exports. Raised to at least 100 ms.                                 |
 | `.max_batch_size(..)`      | `512`               | How many buffered records trigger an export early.                                       |
 | `.max_buffered(..)`        | `8192`              | Per-signal buffer ceiling. This is what a stalled collector can cost in memory.          |
 | `.timeout(..)`             | `10s`               | How long one export attempt may take, and so how long `shutdown` can block.              |
@@ -210,12 +210,12 @@ assert_eq!((STEP_SECONDS.count(&[]), STEP_SECONDS.sum(&[])), (1, 0.25));
 assert_eq!(RESIDENT.value(&[("provider", "cpu")]), None);
 ```
 
-| Method | Returns | For a series never written |
-|---|---|---|
-| `Counter::value(tags)` | the running total | `0` |
-| `Gauge::value(tags)` | the last value set | `None` |
-| `Histogram::count(tags)` | how many values were recorded | `0` |
-| `Histogram::sum(tags)` | their total | `0.0` |
+| Method                   | Returns                       | For a series never written |
+|--------------------------|-------------------------------|----------------------------|
+| `Counter::value(tags)`   | the running total             | `0`                        |
+| `Gauge::value(tags)`     | the last value set            | `None`                     |
+| `Histogram::count(tags)` | how many values were recorded | `0`                        |
+| `Histogram::sum(tags)`   | their total                   | `0.0`                      |
 
 - **Tags match as they do when writing.** `&[]` reads the untagged series, the one `increment`, `set` and `record`
   write. Tag order does not matter.

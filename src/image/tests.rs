@@ -1818,3 +1818,32 @@ mod raw {
         );
     }
 }
+
+#[test]
+fn a_jpeg_decodes_upright_from_its_exif_orientation() {
+    use ::image::ImageEncoder;
+    use ::image::codecs::jpeg::JpegEncoder;
+
+    let mut jpeg = Vec::new();
+    JpegEncoder::new(&mut jpeg)
+        .write_image(RgbImage::new(4, 2).as_raw(), 4, 2, ColorType::Rgb8.into())
+        .unwrap();
+
+    // An APP1 segment holding one EXIF tag, Orientation (0x0112) = 6: "rotate 90° clockwise to display".
+    let exif: [u8; 36] = [
+        0xFF, 0xE1, 0x00, 0x22, b'E', b'x', b'i', b'f', 0, 0, // marker, length, identifier
+        b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, // little-endian TIFF header, IFD at offset 8
+        0x01, 0x00, // one entry
+        0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, // Orientation, SHORT, 1, 6
+        0x00, 0x00, 0x00, 0x00, // no next IFD
+    ];
+    jpeg.splice(2..2, exif);
+
+    let image = decode_bytes(&jpeg).unwrap();
+
+    assert_eq!(
+        (image.width(), image.height()),
+        (2, 4),
+        "the stored 4x2 frame was not turned upright"
+    );
+}

@@ -41,12 +41,27 @@ fn big_int(value: u64) -> Json {
     Json::String(value.to_string())
 }
 
+/// Encodes a double the way proto3 JSON does.
+///
+/// `serde_json` writes a NaN or an infinity as `null`, which a collector rejects wherever it expects a number — and
+/// one such field fails the whole payload it sits in. proto3's JSON mapping spells the three non-finite values as
+/// strings instead.
+fn double(value: f64) -> Json {
+    if value.is_nan() {
+        Json::from("NaN")
+    } else if value.is_infinite() {
+        Json::from(if value > 0.0 { "Infinity" } else { "-Infinity" })
+    } else {
+        Json::from(value)
+    }
+}
+
 /// Encodes one [`Value`] as an OTLP `AnyValue`.
 fn any_value(value: &Value) -> Json {
     match value {
         Value::Bool(inner) => json!({ "boolValue": inner }),
         Value::Int(inner) => json!({ "intValue": inner.to_string() }),
-        Value::Double(inner) => json!({ "doubleValue": inner }),
+        Value::Double(inner) => json!({ "doubleValue": double(*inner) }),
         Value::String(inner) => json!({ "stringValue": inner }),
         // The one `bytes` field that really is base64, unlike the trace and span identifiers.
         Value::Bytes(inner) => json!({ "bytesValue": base64(inner) }),
@@ -287,7 +302,7 @@ pub(super) fn metrics(
                         "dataPoints": points.iter().map(|point| json!({
                             "attributes": tag_values(&point.tags),
                             "timeUnixNano": big_int(now_unix_nano),
-                            "asDouble": point.value,
+                            "asDouble": double(point.value),
                         })).collect::<Vec<_>>(),
                     }
                 }),
@@ -306,7 +321,7 @@ pub(super) fn metrics(
                                 "startTimeUnixNano": big_int(start_unix_nano),
                                 "timeUnixNano": big_int(now_unix_nano),
                                 "count": big_int(point.count),
-                                "sum": point.sum,
+                                "sum": double(point.sum),
                                 "explicitBounds": bounds,
                                 "bucketCounts": point.bucket_counts.iter().copied().map(big_int).collect::<Vec<_>>(),
                             })

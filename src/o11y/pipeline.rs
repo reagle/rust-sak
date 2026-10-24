@@ -64,7 +64,14 @@ pub(super) struct Control {
     pub(super) shutdown: bool,
     /// Whether an export was asked for before the interval elapsed.
     pub(super) flush_requested: bool,
-    /// Incremented after every export cycle, so [`flush`] can tell that its request was served.
+    /// Whether a buffer has reached `max_batch_size` since the worker last started an export.
+    ///
+    /// A flag rather than a bare notification: the worker re-checks its conditions on every wake-up and goes back to
+    /// sleep when none holds, so a wake that leaves nothing behind for it to find is no wake at all.
+    pub(super) batch_ready: bool,
+    /// Incremented when an export cycle *starts* draining the buffers.
+    pub(super) started: u64,
+    /// Incremented when an export cycle *finishes*, so [`flush`] can tell that its request was served.
     pub(super) generation: u64,
 }
 
@@ -93,24 +100,34 @@ pub(super) fn init(config: Config) -> Result<()> {
     }
 
     let enrichment = Arc::new(Enrichment::new(&config.service_name));
-
-    // The single call site for the location lookup: unreachable unless collection is on *and* it was opted into.
-    if config.geolocation {
-        let enrichment = Arc::clone(&enrichment);
-        let url = config.geolocation_url.clone();
-        let timeout = config.geolocation_timeout;
-
-        std::thread::spawn(move || {
-            if let Ok(geo) = fetch_geolocation_with(&url, timeout) {
-                enrichment.set_location(&geo);
-            }
-        });
-    }
+    let geolocation = config
+        .geolocation
+        .then(|| (config.geolocation_url.clone(), config.geolocation_timeout));
 
     let min_level = config.min_level;
-    let shared = shared_from(config, headers, enrichment);
+    let shared = shared_from(config, headers, Arc::clone(&enrichment));
 
-    let worker = worker::spawn(Arc::clone(&shared));
+    // Before anything is published: a worker that cannot start would leave the gates open onto buffers nobody
+    // drains. The claim is released again, so a later `init` can try once more.
+    let worker = match worker::spawn(Arc::clone(&shared)) {
+        Ok(worker) => worker,
+        Err(err) => {
+            INITIALIZED.store(false, Ordering::SeqCst);
+            return Err(O11yError::Io(err));
+        }
+    };
+
+    // The single call site for the location lookup: unreachable unless collection is on *and* it was opted into.
+    // Best effort, like the lookup itself — a thread that cannot start just means no location attributes.
+    if let Some((url, timeout)) = geolocation {
+        let _ = std::thread::Builder::new()
+            .name("rust-sak-o11y-geo".to_string())
+            .spawn(move || {
+                if let Ok(geo) = fetch_geolocation_with(&url, timeout) {
+                    enrichment.set_location(&geo);
+                }
+            });
+    }
 
     let _ = PIPELINE.set(Pipeline {
         shared,
@@ -168,7 +185,7 @@ fn is_reserved(key: &str) -> bool {
 /// Rejects an endpoint that is not a usable URL.
 fn validate_endpoint(endpoint: &str) -> Result<()> {
     reqwest::Url::parse(endpoint).map_err(|err| O11yError::InvalidEndpoint {
-        endpoint: endpoint.to_string(),
+        endpoint: super::config::redact_endpoint(endpoint),
         reason: err.to_string(),
     })?;
 
@@ -187,10 +204,14 @@ fn validate_headers(headers: &HashMap<String, String>) -> Result<HeaderMap> {
             .ok()
             .zip(HeaderValue::from_str(value).ok());
 
-        let Some((name, value)) = parse else {
+        let Some((name, mut value)) = parse else {
             return Err(O11yError::InvalidHeader { name: name.clone() });
         };
 
+        // Every exporter header is treated as a credential — in practice they are API keys and bearer tokens. A
+        // sensitive value prints as `Sensitive` in `Shared`'s derived `Debug`, and stays out of HTTP/2's
+        // header-compression table.
+        value.set_sensitive(true);
         parsed.insert(name, value);
     }
 
@@ -229,7 +250,10 @@ pub(super) fn flush() {
         return;
     }
 
-    let target = control.generation + 1;
+    // The first cycle to *start* after this point is the one guaranteed to drain everything recorded before the call.
+    // One already in flight took its buffers earlier, and finishing it must not count — it would let `flush` return
+    // with the caller's latest records still queued.
+    let target = control.started + 1;
     control.flush_requested = true;
     pipeline.shared.wake.notify_all();
 
@@ -293,8 +317,10 @@ pub(super) fn record_span(record: SpanRecord) {
 ///
 /// Deliberately `==` rather than `>=`: a buffer that sits above the threshold while an export is in flight would
 /// otherwise notify on every single push, which is exactly the wrong behaviour under load.
-fn wake_if_batched(shared: &Shared, queued: usize) {
+pub(super) fn wake_if_batched(shared: &Shared, queued: usize) {
     if queued == shared.config.max_batch_size {
+        let mut control = shared.control.lock().unwrap_or_else(PoisonError::into_inner);
+        control.batch_ready = true;
         shared.wake.notify_all();
     }
 }

@@ -27,6 +27,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the worker exports, when not overridden.
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The shortest flush interval [`ConfigBuilder::flush_interval`] accepts.
+const MIN_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+
 /// How many records force an early export, when not overridden.
 const DEFAULT_MAX_BATCH_SIZE: usize = 512;
 
@@ -125,7 +128,7 @@ impl Config {
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &redact_endpoint(&self.endpoint))
             .field("headers", &self.headers.keys().collect::<Vec<_>>())
             .field("service_name", &self.service_name)
             .field("service_version", &self.service_version)
@@ -141,6 +144,33 @@ impl fmt::Debug for Config {
             .field("geolocation_url", &self.geolocation_url)
             .field("geolocation_timeout", &self.geolocation_timeout)
             .finish_non_exhaustive()
+    }
+}
+
+/// The endpoint with any credentials it carries replaced, for `Debug` output and error messages.
+///
+/// A collector URL can hold a secret in two places — `user:password@` before the host, or a token in the query — and
+/// both are blanked. Done on the text rather than through a URL parser, because it also has to cover the endpoint
+/// that just failed to parse.
+pub(super) fn redact_endpoint(endpoint: &str) -> String {
+    let (before_query, query) = match endpoint.split_once('?') {
+        Some((before, _)) => (before, "?<redacted>"),
+        None => (endpoint, ""),
+    };
+
+    let (scheme, rest) = match before_query.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, before_query),
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let rest = match rest[..authority_end].rfind('@') {
+        Some(at) => format!("<redacted>{}", &rest[at..]),
+        None => rest.to_string(),
+    };
+
+    match scheme {
+        Some(scheme) => format!("{scheme}://{rest}{query}"),
+        None => format!("{rest}{query}"),
     }
 }
 
@@ -225,8 +255,11 @@ impl ConfigBuilder {
     }
 
     /// Sets how often the worker exports whatever has accumulated. Defaults to five seconds.
+    ///
+    /// Raised to at least 100 milliseconds: an interval of zero would have the worker drain empty buffers and
+    /// snapshot every metric in a busy loop.
     pub fn flush_interval(mut self, interval: Duration) -> Self {
-        self.config.flush_interval = interval;
+        self.config.flush_interval = interval.max(MIN_FLUSH_INTERVAL);
         self
     }
 

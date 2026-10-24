@@ -100,12 +100,18 @@ mod imp {
     /// NVIDIA driver is the normal case rather than a probe that could not run.
     pub(in super::super) fn gpus() -> Vec<GpuInfo> {
         // SAFETY: loading NVML runs its initialisers, which the driver ships precisely for a process to load it.
-        let Some(library) = LIBRARIES.iter().find_map(|path| unsafe { Library::new(path) }.ok()) else {
+        let Some(library) = LIBRARIES.iter().find_map(|path| unsafe { Library::new(*path) }.ok()) else {
             return Vec::new();
         };
 
         // SAFETY: each symbol is declared with the signature `nvml.h` gives it, and none outlives `library`.
-        unsafe { enumerate(&library) }.unwrap_or_default()
+        let gpus = unsafe { enumerate(&library) }.unwrap_or_default();
+
+        // Never unloaded, like the CUDA driver and the WebGPU probe's libraries: NVML is part of the NVIDIA driver, and
+        // a driver is not written to be torn down again (see the WSL crash described in `webgpu`).
+        std::mem::forget(library);
+
+        gpus
     }
 
     /// Initialises NVML, reads every device and shuts it down again.

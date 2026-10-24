@@ -4,12 +4,13 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use super::user_config_dir::config_root;
-use super::user_dir::{mk_user_dir_at, user_path};
+use super::user_dir::{CONFIG_DIR_MODE, mk_user_dir_at, user_path};
 use super::{FsError, Result};
 
-/// The mode new configuration files are created with: readable by all, writable by the owner.
+/// The mode new configuration files are created with: readable and writable by the owner only, since configuration
+/// often holds API keys and tokens.
 #[cfg(unix)]
-const FILE_MODE: u32 = 0o644;
+const FILE_MODE: u32 = 0o600;
 
 /// Creates (if needed) and opens a file inside an application's configuration directory, for reading and writing.
 ///
@@ -17,8 +18,8 @@ const FILE_MODE: u32 = 0o644;
 /// `%LOCALAPPDATA%`, which does not roam with the user's profile.
 ///
 /// `file_path` is a relative path within the application's directory, so `"config.toml"` and `"themes/dark.toml"`
-/// both work — any missing parent directories are created with mode `0o755`. The file itself is created with mode
-/// `0o644` on Unix.
+/// both work — any missing parent directories are created with mode `0o700`. The file itself is created with mode
+/// `0o600` on Unix: configuration often holds credentials, so neither is readable by other users.
 ///
 /// **The file is not truncated.** An existing configuration file is opened with its contents intact and the cursor at
 /// the start, so a caller that means to replace it must truncate deliberately. An existing file also keeps its
@@ -53,7 +54,7 @@ pub(super) fn mk_config_file_at(root: &Path, name: &str, file_path: &Path) -> Re
     }
 
     let sub_dir = file_path.parent().unwrap_or_else(|| Path::new(""));
-    mk_user_dir_at(root, name, sub_dir)?;
+    mk_user_dir_at(root, name, sub_dir, CONFIG_DIR_MODE)?;
 
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);

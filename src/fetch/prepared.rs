@@ -14,6 +14,9 @@ pub(super) struct PreparedRequest {
     pub(super) headers: HeaderMap,
     pub(super) body: Option<serde_json::Value>,
     pub(super) retries: u32,
+    /// The largest body the `text` and `json` methods will read. `None` reads any size. Downloads stream to disk and
+    /// ignore it.
+    pub(super) max_body_bytes: Option<u64>,
 }
 
 impl PreparedRequest {

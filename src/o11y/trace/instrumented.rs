@@ -29,15 +29,28 @@ impl<F: Future> Future for Instrumented<F> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         let this = self.project();
 
-        this.span.enter();
-        let polled = this.inner.poll(cx);
-        this.span.exit();
+        let polled = {
+            this.span.enter();
+            // Exited from a guard, so a panicking poll still takes the span back off this thread's stack instead of
+            // leaving it there as the parent of every span opened on the thread afterwards.
+            let _exit = Exit(&mut *this.span);
+            this.inner.poll(cx)
+        };
 
         if polled.is_ready() {
             this.span.finish();
         }
 
         polled
+    }
+}
+
+/// Takes a [`PendingSpan`] back off the current thread's stack when dropped.
+struct Exit<'a>(&'a mut PendingSpan);
+
+impl Drop for Exit<'_> {
+    fn drop(&mut self) {
+        self.0.exit();
     }
 }
 

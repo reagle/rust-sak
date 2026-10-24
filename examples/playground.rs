@@ -2,10 +2,10 @@
 //!
 //! Run with: `cargo run --example playground --features fetch`
 
-use rust_sak::fetch::Fetch;
+use rust_sak::fetch::{Fetch, FetchError};
 
 #[tokio::main]
-async fn main() -> Result<(), reqwest::Error> {
+async fn main() -> Result<(), FetchError> {
     let fetch = Fetch::new();
 
     let body = fetch

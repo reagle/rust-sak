@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 
 use liblzma::read::XzDecoder;
@@ -40,7 +39,10 @@ pub fn untar_xz(
     target_dir: impl AsRef<Path>,
     options: &ExtractOptions,
 ) -> Result<ExtractSummary> {
-    let decoder = XzDecoder::new(BufReader::new(File::open(archive)?));
+    // Multi-stream, as `xz -d` is: parallel compressors such as `pixz` and plain concatenation both write several
+    // streams, and a single-stream decoder would stop at the first one's end, which `tar` may read as end of archive.
+    // `XzDecoder` buffers its input itself.
+    let decoder = XzDecoder::new_multi_decoder(File::open(archive)?);
     let mut tar = tar::Archive::new(decoder);
 
     // TAR carries its sizes inside the compressed stream, so a total would mean decompressing the whole archive twice.
@@ -55,14 +57,19 @@ pub fn untar_xz(
         let entry_type = entry.header().entry_type();
         let mode = entry.header().mode().ok();
         let size = entry.size();
+        let kind = classify(entry_type);
+        // Decoded only for a link that will be created: a hard link, or any link under `symlinks(false)`, is skipped
+        // whatever its target says, and must not fail the whole extraction over bytes nothing reads.
         let link_target = match entry.link_name_bytes() {
-            Some(target) => Some(Cow::Owned(utf8_name(&target, "symlink target")?)),
-            None => None,
+            Some(target) if kind == EntryKind::Symlink && options.symlinks => {
+                Some(Cow::Owned(utf8_name(&target, "symlink target")?))
+            }
+            _ => None,
         };
 
         let raw = RawEntry {
             name: Cow::Owned(name),
-            kind: classify(entry_type),
+            kind,
             size,
             mode,
             link_target,

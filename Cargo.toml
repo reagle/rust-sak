@@ -49,14 +49,18 @@ dbg_macro = "warn"
 workspace = true
 
 [dependencies]
-avif = { package = "avif-rs", version = "26.10.1", optional = true }
+avif = { package = "avif-rs", version = "26.10.2", optional = true }
 cap-std = { version = "4.0.3", optional = true }
 dirs = { version = "7.0", optional = true }
 enough = { version = "0.4", default-features = false, optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
-heif = { package = "heif-rs", version = "26.10.0", optional = true }
+heif = { package = "heif-rs", version = "26.10.1", optional = true }
 hex = { version = "0.4.3", optional = true }
 hmac = { version = "0.13.0", optional = true }
+# Only to rebuild a `reqwest::Response` around a body read under `max_body_bytes`; already in the tree through `reqwest`.
+http = { version = "1", optional = true }
+# Parses the date form of `Retry-After`.
+httpdate = { version = "1.0.3", optional = true }
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff"], optional = true }
 liblzma = { version = "0.4", default-features = false, features = ["static"], optional = true }
 machine-uid = { version = "0.6.0", optional = true }
@@ -83,7 +87,7 @@ reqwest = { version = "0.13.4", features = ["query", "json", "stream"], optional
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.150", optional = true }
 semver = { version = "1", optional = true }
-sevenz-rust2 = { version = "0.23", optional = true }
+sevenz-rust2 = { version = "0.24", optional = true }
 sha2 = { version = "0.11.0", optional = true }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"], optional = true }
 tar = { version = "0.4", optional = true }
@@ -96,7 +100,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64", "alloc"], optional = true }
 uuid = { version = "1.26.0", default-features = false, features = ["v4"], optional = true }
 walkdir = { version = "2.5", optional = true }
-webp = { package = "webp-rs", version = "26.10.0", optional = true }
+webp = { package = "webp-rs", version = "26.10.1", optional = true }
 zenpixels = { version = "0.2", default-features = false, optional = true }
 zenraw = { version = "0.2", default-features = false, features = ["rawler", "rawloader"], optional = true }
 zip = { version = "9", default-features = false, features = [
@@ -148,7 +152,7 @@ libc = { version = "0.2", optional = true }
 # are loaded at runtime: a machine without the NVIDIA driver has no `libnvidia-ml.so.1` or `nvcuda.dll`, one without
 # Vulkan no `libvulkan.so.1`, and linking against any of them would stop this crate loading there at all.
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-libloading = { version = "0.8", optional = true }
+libloading = { version = "0.9", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [
@@ -166,7 +170,17 @@ tokio = { version = "1.52.3", features = ["macros", "rt", "time", "test-util", "
 default = []
 crypto = ["dep:sha2", "dep:hex", "dep:twox-hash"]
 # `sha2`/`hex` are here for `RequestOptions::digest`, which hashes a transfer's bytes as they are written.
-fetch = ["dep:reqwest", "dep:tokio", "dep:serde", "dep:serde_json", "dep:futures-util", "dep:sha2", "dep:hex"]
+fetch = [
+    "dep:futures-util",
+    "dep:hex",
+    "dep:http",
+    "dep:httpdate",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:tokio",
+]
 fs = [
     "dep:cap-std",
     "dep:dirs",

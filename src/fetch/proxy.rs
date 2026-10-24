@@ -17,7 +17,7 @@ use std::fmt;
 ///     .basic_auth("user", "secret")
 ///     .no_proxy("localhost,127.0.0.1,.internal");
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProxySettings {
     /// The proxy URL, applied to both HTTP and HTTPS requests.
     pub(super) url: String,
@@ -75,6 +75,21 @@ impl ProxySettings {
         }
 
         Ok(proxy)
+    }
+}
+
+impl fmt::Debug for ProxySettings {
+    /// Like [`Display`](fmt::Display), never shows the password: `Fetch` derives `Debug`, so a derived one here would
+    /// put the credentials into any `{:?}` of a client.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxySettings")
+            .field("url", &self.url)
+            .field(
+                "basic_auth",
+                &self.basic_auth.as_ref().map(|(username, _)| (username, "<redacted>")),
+            )
+            .field("no_proxy", &self.no_proxy)
+            .finish()
     }
 }
 

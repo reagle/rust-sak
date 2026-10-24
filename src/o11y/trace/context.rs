@@ -125,24 +125,46 @@ impl SpanState {
     }
 }
 
+/// Reads this thread's stack, or returns `None` when it cannot be reached.
+///
+/// Two situations make it unreachable, and telemetry must not panic in either: the thread is tearing down its
+/// thread-locals (a span dropped from another thread-local's destructor), or the stack is already borrowed further up
+/// this very call — user code running inside [`with_current`], such as a `Display` impl that logs.
+fn read<R>(visit: impl FnOnce(&Vec<SpanState>) -> R) -> Option<R> {
+    STACK
+        .try_with(|stack| stack.try_borrow().ok().map(|stack| visit(&stack)))
+        .ok()
+        .flatten()
+}
+
+/// Mutates this thread's stack, or returns `None` when it cannot be reached. See [`read`] for when that is.
+fn write<R>(visit: impl FnOnce(&mut Vec<SpanState>) -> R) -> Option<R> {
+    STACK
+        .try_with(|stack| stack.try_borrow_mut().ok().map(|mut stack| visit(&mut stack)))
+        .ok()
+        .flatten()
+}
+
 /// The context of the innermost open span, if there is one.
 ///
 /// This is what stamps a log record with the span it was emitted inside, giving a backend the link between the two.
 pub(in crate::o11y) fn current_context() -> Option<SpanContext> {
-    STACK.with_borrow(|stack| stack.last().map(SpanState::context))
+    read(|stack| stack.last().map(SpanState::context)).flatten()
 }
 
 /// The trace id and parent a span opened right now would inherit.
 pub(super) fn inherit() -> (TraceId, Option<SpanId>) {
-    STACK.with_borrow(|stack| match stack.last() {
-        Some(parent) => (parent.trace_id, Some(parent.span_id)),
-        None => (super::super::ids::new_trace_id(), None),
-    })
+    read(|stack| stack.last().map(|parent| (parent.trace_id, parent.span_id)))
+        .flatten()
+        .map_or_else(
+            || (super::super::ids::new_trace_id(), None),
+            |(trace_id, span_id)| (trace_id, Some(span_id)),
+        )
 }
 
-/// Pushes an open span onto this thread's stack.
+/// Pushes an open span onto this thread's stack. A stack that cannot be reached loses the span rather than panic.
 pub(super) fn push(state: SpanState) {
-    STACK.with_borrow_mut(|stack| stack.push(state));
+    write(|stack| stack.push(state));
 }
 
 /// Removes the span with `span_id`, wherever it sits on the stack.
@@ -151,16 +173,21 @@ pub(super) fn push(state: SpanState) {
 /// a collection, can drop out of order — in which case the entries above it keep the parent they were given when
 /// they opened, which is the honest record of what actually nested inside what.
 pub(super) fn remove(span_id: SpanId) -> Option<SpanState> {
-    STACK.with_borrow_mut(|stack| {
+    write(|stack| {
         let index = stack.iter().rposition(|span| span.span_id == span_id)?;
 
         Some(stack.remove(index))
     })
+    .flatten()
 }
 
 /// Runs `visit` against the innermost open span, doing nothing if there is none.
+///
+/// The stack stays borrowed while `visit` runs, so `visit` must not call back into anything that reads it — callers
+/// convert user-supplied values *before* calling this. If one does anyway, the inner call finds the stack unreachable
+/// and does nothing, instead of panicking.
 pub(super) fn with_current<R>(visit: impl FnOnce(&mut SpanState) -> R) -> Option<R> {
-    STACK.with_borrow_mut(|stack| stack.last_mut().map(visit))
+    write(|stack| stack.last_mut().map(visit)).flatten()
 }
 
 /// The innermost open span's name and captured fields. Test-only.

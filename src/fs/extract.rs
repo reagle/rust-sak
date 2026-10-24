@@ -16,6 +16,13 @@ const MAX_SYMLINK_TARGET: u64 = 4096;
 /// The mode a directory gets when the archive records none.
 const DEFAULT_DIR_MODE: u32 = 0o755;
 
+/// The bits stripped from every directory mode an archive records.
+///
+/// A file's mode goes through `open`, which the process umask filters; a directory's is applied afterwards with
+/// `chmod`, which nothing filters. Masking group and other write here is what keeps a `0o777` directory in an
+/// archive from landing world-writable while a `0o666` file beside it lands as `0o644`.
+const DIR_MODE_MASK: u32 = 0o022;
+
 /// How many bytes may be written between progress updates before one is forced out.
 ///
 /// Entry bodies are copied in chunks of a few kilobytes, so reporting per chunk would mean tens of thousands of calls
@@ -232,6 +239,8 @@ pub(super) struct Extractor<'a> {
     options: &'a ExtractOptions,
     budget: Budget<'a>,
     dir_modes: Vec<(PathBuf, u32)>,
+    /// Every link created so far, as `(path, link name, target)`, for the re-check in [`Extractor::finish`].
+    links: Vec<(PathBuf, String, String)>,
     summary: ExtractSummary,
     reporter: Reporter<'a>,
 }
@@ -251,6 +260,7 @@ impl<'a> Extractor<'a> {
             options,
             budget: Budget::new(options),
             dir_modes: Vec::new(),
+            links: Vec::new(),
             summary: ExtractSummary::default(),
             reporter: Reporter::new(options, totals),
         })
@@ -299,15 +309,24 @@ impl<'a> Extractor<'a> {
         }
     }
 
-    /// Finishes the extraction, applying the directory modes that were deferred.
+    /// Finishes the extraction, re-checking every link and applying the directory modes that were deferred.
+    ///
+    /// Each link was checked when it was created, but a link that dangled then may resolve now that later entries
+    /// exist. Checking them all again against the finished tree is what guarantees that no link handed back to the
+    /// caller leads outside it, whatever order the archive created them in.
     ///
     /// Modes are applied **deepest first**. A directory the archive wants at `0o500` cannot be tightened while its
     /// children are still being written, so the real mode waits until everything inside it exists.
     ///
     /// # Errors
     ///
-    /// Returns [`FsError::Io`] if a mode cannot be applied.
+    /// Returns [`FsError::IllegalSymlink`] if a link now resolves outside the root, and [`FsError::Io`] if a mode
+    /// cannot be applied.
     pub(super) fn finish(mut self) -> Result<ExtractSummary> {
+        for (path, link, target) in &self.links {
+            self.root.verify_symlink(path, link, target)?;
+        }
+
         #[cfg(unix)]
         {
             self.dir_modes
@@ -328,7 +347,7 @@ impl<'a> Extractor<'a> {
         if let Some(mode) = mode {
             let mode = match permissions(mode) {
                 0 => DEFAULT_DIR_MODE,
-                bits => bits,
+                bits => bits & !DIR_MODE_MASK,
             };
             self.dir_modes.push((path.to_path_buf(), mode));
         }
@@ -353,16 +372,24 @@ impl<'a> Extractor<'a> {
 
         // Reading one byte past the declared size is what turns "the header lied" into an error instead of a file
         // silently truncated at the length the archive claimed.
-        let written = io::copy(&mut data.take(declared.saturating_add(1)), &mut writer)?;
-        writer.flush()?;
+        let copied = io::copy(&mut data.take(declared.saturating_add(1)), &mut writer)
+            .and_then(|written| writer.flush().map(|()| written));
         drop(writer);
 
-        if written > declared {
-            return Err(FsError::DeclaredSizeMismatch {
-                entry: entry.name.to_string(),
-                declared,
-            });
-        }
+        let written = match copied {
+            Ok(written) if written <= declared => written,
+            failed => {
+                // A half-written file is worse than none: the caller cannot tell it from a complete one.
+                let _ = self.root.remove_file(path);
+                return Err(match failed {
+                    Ok(_) => FsError::DeclaredSizeMismatch {
+                        entry: entry.name.to_string(),
+                        declared,
+                    },
+                    Err(err) => FsError::Io(err),
+                });
+            }
+        };
 
         self.budget.settle(declared, written);
         self.summary.files += 1;
@@ -398,7 +425,9 @@ impl<'a> Extractor<'a> {
             return Ok(());
         }
 
-        self.root.verify_symlink(path, &components.join("/"), &target)?;
+        let link = components.join("/");
+        self.root.verify_symlink(path, &link, &target)?;
+        self.links.push((path.to_path_buf(), link, target));
         self.summary.symlinks += 1;
 
         Ok(())
@@ -406,9 +435,18 @@ impl<'a> Extractor<'a> {
 }
 
 /// Reads a symbolic link's target from an entry's stream, bounded by [`MAX_SYMLINK_TARGET`].
+///
+/// One byte past the bound is read so that an over-long target is refused rather than silently cut short — a
+/// truncated target is a link to somewhere the archive never named.
 fn read_link_target(data: &mut dyn Read) -> Result<String> {
     let mut target = String::new();
-    data.take(MAX_SYMLINK_TARGET).read_to_string(&mut target)?;
+    data.take(MAX_SYMLINK_TARGET + 1).read_to_string(&mut target)?;
+    if target.len() as u64 > MAX_SYMLINK_TARGET {
+        return Err(FsError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("symbolic link target is longer than {MAX_SYMLINK_TARGET} bytes"),
+        )));
+    }
 
     Ok(target.trim_end_matches(['\r', '\n', '\0']).to_string())
 }

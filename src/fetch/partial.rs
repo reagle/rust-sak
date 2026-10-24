@@ -34,6 +34,10 @@ pub(super) struct Sidecar {
     /// bytes changed at an unchanged URL answers `200` instead of `206`.
     #[serde(default)]
     pub etag: Option<String>,
+    /// The `Last-Modified` date the response carried, when it carried one. The `If-Range` validator of last resort,
+    /// for a resource that has no strong `ETag`.
+    #[serde(default)]
+    pub last_modified: Option<String>,
     /// The full size the response advertised, when it advertised one. Recorded for diagnostics — the resume offset
     /// always comes from the `.part` file's actual length, never from here.
     #[serde(default)]
@@ -166,6 +170,7 @@ mod tests {
         let sidecar = Sidecar {
             url: "https://example.com/a.7z".to_string(),
             etag: Some("\"abc\"".to_string()),
+            last_modified: None,
             total: Some(10),
             resume_key: Some("hash".to_string()),
         };
@@ -198,6 +203,7 @@ mod tests {
         let sidecar = Sidecar {
             url: "https://example.com/x.bin".to_string(),
             etag: None,
+            last_modified: None,
             total: None,
             resume_key: None,
         };
@@ -237,6 +243,7 @@ mod tests {
         let ours = Sidecar {
             url: identity.url.clone(),
             etag: None,
+            last_modified: None,
             total: None,
             resume_key: None,
         };
@@ -272,6 +279,7 @@ mod tests {
             &Sidecar {
                 url: "https://example.com/x.bin".to_string(),
                 etag: None,
+                last_modified: None,
                 total: None,
                 resume_key: None,
             },

@@ -62,10 +62,17 @@ impl<T> Buffer<T> {
     /// The lock is held only for the swap — serialising and sending happen with nothing held, so an emitting thread
     /// never waits on the network.
     pub(super) fn take(&self) -> (Vec<T>, u64) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let dropped = std::mem::replace(&mut state.dropped, 0);
+        let (queue, dropped) = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            (
+                std::mem::take(&mut state.queue),
+                std::mem::replace(&mut state.dropped, 0),
+            )
+        };
 
-        (state.queue.drain(..).collect(), dropped)
+        // Converted after the lock is released: copying thousands of records out of a ring buffer is exactly the work
+        // an emitting thread must never wait behind.
+        (Vec::from(queue), dropped)
     }
 
     /// How many entries are queued right now.

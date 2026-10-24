@@ -79,6 +79,9 @@ pub(super) fn decode_any(bytes: &[u8], format: DecodeFormat) -> Result<DynamicIm
 
 /// Decodes `bytes` known to be in `format`, routing native formats through the `image` crate and `avif`/`heif`/`webp`
 /// through their dedicated codecs. Shared by every decode entry point.
+///
+/// A native image comes back **upright**: the EXIF orientation a camera or phone records is applied, so a portrait
+/// photo is not returned on its side. That matches the RAW path, which has always applied it.
 pub(super) fn decode_with_format(bytes: &[u8], format: ImageFormat) -> Result<DynamicImage> {
     match format {
         ImageFormat::Avif => Ok(::avif::decode(bytes)?),
@@ -88,7 +91,14 @@ pub(super) fn decode_with_format(bytes: &[u8], format: ImageFormat) -> Result<Dy
             let image_format = native
                 .to_image_format()
                 .expect("native formats map to image::ImageFormat");
-            Ok(::image::load_from_memory_with_format(bytes, image_format)?)
+            // Through a decoder rather than `load_from_memory_with_format`, which is the only way to reach the
+            // orientation. `into_decoder` applies the same default allocation limits the one-call form did.
+            let mut decoder = ImageReader::with_format(Cursor::new(bytes), image_format).into_decoder()?;
+            let orientation = decoder.orientation()?;
+            let mut image = DynamicImage::from_decoder(decoder)?;
+            image.apply_orientation(orientation);
+
+            Ok(image)
         }
     }
 }

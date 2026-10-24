@@ -39,6 +39,8 @@ pub struct RequestOptions {
     pub(super) retry_non_idempotent: bool,
     /// JSON request body, serialized eagerly by [`RequestOptions::body`]. `None` sends no body.
     pub(super) body: Option<serde_json::Value>,
+    /// Body size limit override. `None` inherits the struct's limit.
+    pub(super) max_body_bytes: Option<u64>,
     /// Download behavior when a file already exists at the target path (only used by
     /// [`Fetch::download`](super::Fetch::download)). `None` inherits the struct's default.
     pub(super) download_mode: Option<DownloadMode>,
@@ -83,7 +85,8 @@ impl RequestOptions {
     }
 
     /// Replaces the full set of per-request headers.
-    pub fn headers(mut self, headers: HeaderMap) -> Self {
+    pub fn headers(mut self, mut headers: HeaderMap) -> Self {
+        super::mark_credentials(&mut headers);
         self.headers = headers;
         self
     }
@@ -122,6 +125,21 @@ impl RequestOptions {
     /// Panics if `body` cannot be serialized to JSON.
     pub fn body<T: serde::Serialize>(mut self, body: T) -> Self {
         self.body = Some(serde_json::to_value(body).expect("request body is not serializable to JSON"));
+        self
+    }
+
+    /// Caps the response body this request may read, overriding [`Fetch::max_body_bytes`](super::Fetch::max_body_bytes).
+    ///
+    /// A larger body fails with [`FetchError::BodyTooLarge`](super::FetchError::BodyTooLarge), and is not retried.
+    /// Has no effect on [`Fetch::download`](super::Fetch::download), which streams to disk rather than into memory.
+    ///
+    /// ```
+    /// use rust_sak::fetch::RequestOptions;
+    ///
+    /// let options = RequestOptions::new().max_body_bytes(1 << 20);
+    /// ```
+    pub fn max_body_bytes(mut self, limit: u64) -> Self {
+        self.max_body_bytes = Some(limit);
         self
     }
 

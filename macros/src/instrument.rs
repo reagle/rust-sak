@@ -24,6 +24,7 @@ pub(crate) fn expand(args: TokenStream, item: TokenStream) -> TokenStream {
 fn try_expand(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     let options = Options::parse(args)?;
     let mut function: ItemFn = parse2(item)?;
+    check_skips(&function.sig, &options)?;
 
     let name = options.name.clone().unwrap_or_else(|| function.sig.ident.to_string());
     let fields = captured_fields(&function.sig, &options);
@@ -60,6 +61,35 @@ fn try_expand(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     function.block = parse2(instrumented)?;
 
     Ok(quote! { #function })
+}
+
+/// Rejects a `skip(..)` name that matches no parameter.
+///
+/// Silently ignoring one would turn a typo into a leak: `skip(pasword)` would leave `password` captured and exported
+/// with every span. Every unknown name is reported, not just the first, so one build shows them all.
+fn check_skips(signature: &Signature, options: &Options) -> syn::Result<()> {
+    let parameters: Vec<&Ident> = signature
+        .inputs
+        .iter()
+        .filter_map(|argument| match argument {
+            FnArg::Typed(typed) => match &*typed.pat {
+                Pat::Ident(pattern) => Some(&pattern.ident),
+                _ => None,
+            },
+            FnArg::Receiver(_) => None,
+        })
+        .collect();
+
+    options
+        .skip
+        .iter()
+        .filter(|skipped| !parameters.contains(skipped))
+        .map(|skipped| Error::new_spanned(skipped, format!("no parameter named `{skipped}` to skip")))
+        .reduce(|mut combined, error| {
+            combined.combine(error);
+            combined
+        })
+        .map_or(Ok(()), Err)
 }
 
 /// Builds the trailing `, key = value` arguments handed to `span!` for the captured parameters.

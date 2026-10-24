@@ -50,12 +50,18 @@ pub(super) struct MemoryStore {
     max_capacity: u64,
 }
 
+/// The most entries the memory tier pre-sizes its table for, whatever [`CacheOpts::max_entries`] asks. The table still
+/// grows past this as entries arrive; only the up-front allocation is bounded.
+const MAX_INITIAL_CAPACITY: u64 = 1 << 16;
+
 impl MemoryStore {
     /// Builds a store sized by `opts`.
     pub(super) fn new(opts: CacheOpts) -> Self {
         let cache = Cache::builder()
             .max_capacity(opts.max_capacity)
-            .initial_capacity(usize::try_from(opts.max_entries).unwrap_or(usize::MAX))
+            // Clamped: moka allocates its table up front from this, so a generous `max_entries` would otherwise be a
+            // generous allocation before a single entry exists — and `u64::MAX` a capacity overflow.
+            .initial_capacity(usize::try_from(opts.max_entries.min(MAX_INITIAL_CAPACITY)).unwrap_or(usize::MAX))
             // Weigh entries by their length, which is what makes `max_capacity` a byte budget rather than a count.
             .weigher(|_key, entry: &MemoryEntry| u32::try_from(entry.value.len()).unwrap_or(u32::MAX))
             .expire_after(DeadlineExpiry)

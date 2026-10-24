@@ -93,6 +93,11 @@ fn unsafe_prefix(path: &str) -> Option<&'static str> {
 /// component by component and tracking the remaining depth catches `../../etc/passwd` while still permitting a link
 /// that climbs and descends within the tree, such as `../sibling/file`.
 ///
+/// A `..` is only accepted **before** the first named component, so every target has the shape `(../)*name(/name)*`.
+/// A `..` after a name climbs back out of whatever that name turns out to be, and the name may be a link a *later*
+/// entry plants: `c` → `d/..` followed by `d` → `.` puts `c` in the root's parent, with each link contained when it
+/// is created. Refusing the shape outright closes that ordering, which no per-link check at creation time can see.
+///
 /// This is a purely lexical check and deliberately not the only one. It cannot see links planted by earlier entries —
 /// `link` → `.` followed by `link/escape` → `..` is contained at every individual step — so the extractor re-checks
 /// each created link through the anchored directory handle as well. This function's job is to reject the obvious
@@ -100,7 +105,8 @@ fn unsafe_prefix(path: &str) -> Option<&'static str> {
 ///
 /// # Errors
 ///
-/// Returns [`FsError::IllegalSymlink`] if the target is absolute, empty, or climbs above the root.
+/// Returns [`FsError::IllegalSymlink`] if the target is absolute, empty, climbs above the root, or climbs after
+/// descending.
 pub(super) fn validate_symlink_target(link_components: &[&str], target: &str) -> Result<()> {
     let reject = || {
         Err(FsError::IllegalSymlink {
@@ -117,14 +123,16 @@ pub(super) fn validate_symlink_target(link_components: &[&str], target: &str) ->
 
     // The link resolves from the directory holding it, so it starts one level shallower than its own name.
     let mut depth = link_components.len().saturating_sub(1);
+    let mut descended = false;
     for component in target.split(['/', '\\']) {
         match component {
             "" | "." => continue,
+            ".." if descended => return reject(),
             ".." => match depth.checked_sub(1) {
                 Some(next) => depth = next,
                 None => return reject(),
             },
-            _ => depth += 1,
+            _ => descended = true,
         }
     }
 

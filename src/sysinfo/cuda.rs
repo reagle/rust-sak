@@ -167,7 +167,7 @@ mod imp {
         const LIBRARIES: &[&str] = &["libcuda.so.1", "/usr/lib/wsl/lib/libcuda.so.1"];
 
         // SAFETY: loading the driver runs its initialisers, which it ships precisely for a process to load it.
-        LIBRARIES.iter().find_map(|path| unsafe { Library::new(path) }.ok())
+        LIBRARIES.iter().find_map(|path| unsafe { Library::new(*path) }.ok())
     }
 
     /// Reads the driver's version, initialises it and reads every device.

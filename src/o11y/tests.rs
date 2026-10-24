@@ -1704,3 +1704,128 @@ fn instrument_honours_skip_and_leaves_the_rest_captured() {
     let (_, fields) = quiet.expect("the span is open for the whole body");
     assert!(fields.is_empty(), "`skip_all` captures nothing");
 }
+
+#[test]
+fn a_full_batch_ends_the_workers_wait_early() {
+    let config = Config::builder("http://127.0.0.1:1", NO_HEADERS)
+        .flush_interval(Duration::from_secs(30))
+        .max_batch_size(2)
+        .build();
+    let shared = super::pipeline::test_shared(config);
+
+    // The wake has to leave something behind for the worker to find: a bare notification is re-checked against the
+    // conditions and slept through.
+    super::pipeline::wake_if_batched(&shared, 2);
+    let started = std::time::Instant::now();
+    let shutting_down = worker::wait(&shared, Duration::ZERO);
+
+    assert!(!shutting_down);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the worker slept through a full batch"
+    );
+}
+
+#[test]
+fn a_full_batch_does_not_cut_a_backoff_short() {
+    let config = Config::builder("http://127.0.0.1:1", NO_HEADERS)
+        .flush_interval(Duration::ZERO)
+        .max_batch_size(2)
+        .build();
+    let shared = super::pipeline::test_shared(config);
+    super::pipeline::wake_if_batched(&shared, 2);
+
+    let started = std::time::Instant::now();
+    // A wait that honoured the batch flag during a backoff would return at once.
+    worker::wait(&shared, Duration::from_millis(150));
+
+    assert!(started.elapsed() >= Duration::from_millis(150));
+}
+
+#[test]
+fn non_finite_values_never_reach_a_payload_as_null() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let histogram = metric::histogram("latency").with_buckets(&[2.0, f64::NAN, 1.0, 2.0, f64::INFINITY]);
+    histogram.record(f64::NAN);
+    histogram.record(f64::NEG_INFINITY);
+    histogram.record(1.5);
+    let gauge = metric::gauge("temperature");
+    gauge.set(f64::NAN);
+
+    let payload = otlp::metrics(metric::snapshot(), &[], &Arc::new(Vec::new()), 0, 1);
+    let metrics = payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        .as_array()
+        .unwrap();
+    let find = |name: &str| metrics.iter().find(|metric| metric["name"] == name).unwrap();
+
+    let point = &find("latency")["histogram"]["dataPoints"][0];
+    assert_eq!(point["sum"], 1.5, "non-finite values are not recorded");
+    assert_eq!(point["count"], "1");
+    assert_eq!(point["explicitBounds"], serde_json::json!([1.0, 2.0]));
+
+    let point = &find("temperature")["gauge"]["dataPoints"][0];
+    assert_eq!(point["asDouble"], "NaN", "proto3 JSON spells a NaN as a string");
+}
+
+#[test]
+fn a_tag_set_too_wide_to_compare_goes_to_the_overflow_series() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let keys: Vec<String> = (0..65).map(|index| format!("k{index}")).collect();
+    let tags: Vec<(&str, &str)> = keys.iter().map(|key| (key.as_str(), "v")).collect();
+
+    let counter = metric::counter("wide");
+    counter.add_with_tags(1, &tags);
+    counter.add_with_tags(1, &tags);
+
+    let payload = otlp::metrics(metric::snapshot(), &[], &Arc::new(Vec::new()), 0, 1);
+    let points = payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"]
+        .as_array()
+        .unwrap();
+
+    assert_eq!(points.len(), 1, "each call made a series of its own");
+    assert_eq!(points[0]["asInt"], "2");
+}
+
+#[test]
+fn a_panicking_poll_still_takes_its_span_off_the_stack() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    use trace::Instrument;
+
+    let _capture = Capture::start(Level::Debug);
+
+    let mut future = std::pin::pin!(async { panic!("inside the span") }.instrument(trace::span!("doomed")));
+    let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Poll<()> = future.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+    }));
+
+    assert!(polled.is_err());
+    assert_eq!(trace::depth(), 0, "the span outlived its poll");
+}
+
+#[test]
+fn an_endpoint_is_printed_without_its_credentials() {
+    use super::config::redact_endpoint;
+
+    assert_eq!(
+        redact_endpoint("https://user:pass@collector.example.com/v1?token=abc"),
+        "https://<redacted>@collector.example.com/v1?<redacted>"
+    );
+    assert_eq!(
+        redact_endpoint("https://collector.example.com:4318"),
+        "https://collector.example.com:4318"
+    );
+    assert_eq!(redact_endpoint("not a url@all"), "<redacted>@all");
+
+    let config = Config::builder(
+        "https://k:secret@collector.example.com",
+        [("Authorization", "Bearer t0ken")],
+    )
+    .build();
+    let printed = format!("{config:?}");
+    assert!(!printed.contains("secret") && !printed.contains("t0ken"), "{printed}");
+}

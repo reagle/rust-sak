@@ -59,8 +59,8 @@ pub enum O11yError {
     /// The export request or the geolocation request failed outright.
     #[error("telemetry request failed: {0}")]
     Http(#[from] reqwest::Error),
-    /// Reading a response body failed.
-    #[error("reading a telemetry response failed: {0}")]
+    /// Reading a response body failed, or [`init`](super::init) could not start the export thread.
+    #[error("telemetry i/o failed: {0}")]
     Io(#[from] std::io::Error),
     /// A payload could not be serialised, or a geolocation response was not the expected JSON.
     #[error("telemetry payload was not valid json: {0}")]

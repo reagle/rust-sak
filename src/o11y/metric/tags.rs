@@ -71,6 +71,12 @@ impl<T> TagMap<T> {
         make: impl FnOnce() -> T,
         use_series: impl FnOnce(&T) -> R,
     ) -> Option<R> {
+        // A set wider than `same_tags` can compare would never match its own series, so each call would add another
+        // one. Refusing it sends every sample to the overflow series instead.
+        if tags.len() > MASK_BITS {
+            return None;
+        }
+
         let hash = hash_tags(tags);
         let at_capacity = self.series.load(Ordering::Relaxed) >= MAX_SERIES;
 
@@ -162,8 +168,8 @@ const MASK_BITS: usize = u64::BITS as usize;
 ///
 /// The claim set is a bitmask rather than a `Vec<bool>`, so the comparison stays allocation-free — it runs under the
 /// read lock on every tagged record, which is the path [`TagMap::with`] exists to keep cheap. Beyond [`MASK_BITS`]
-/// tags the mask cannot represent the set and the answer is conservatively `false`: a false negative costs a new
-/// series rather than a wrong one.
+/// tags the mask cannot represent the set and the answer is conservatively `false` — which is why [`TagMap::with`]
+/// refuses such sets before ever comparing them.
 fn same_tags(stored: &Tags, probe: &[(&str, &str)]) -> bool {
     if stored.len() != probe.len() || probe.len() > MASK_BITS {
         return false;

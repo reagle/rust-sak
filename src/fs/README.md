@@ -34,8 +34,8 @@ Both are this crate's own types, wrapping [`tempfile`](https://crates.io/crates/
 | Function                | Signature                                                                             | What it does                                          |
 |-------------------------|---------------------------------------------------------------------------------------|-------------------------------------------------------|
 | `user_config_dir`       | `fn user_config_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>`       | Computes the path. **No I/O.**                        |
-| `mk_user_config_dir`    | `fn mk_user_config_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>`    | Creates it (mode `0o755`) and returns the path.       |
-| `mk_user_config_file`   | `fn mk_user_config_file(name: &str, file_path: impl AsRef<Path>) -> Result<File>`     | Creates parents, opens the file read/write (`0o644`). |
+| `mk_user_config_dir`    | `fn mk_user_config_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>`    | Creates it (mode `0o700`) and returns the path.       |
+| `mk_user_config_file`   | `fn mk_user_config_file(name: &str, file_path: impl AsRef<Path>) -> Result<File>`     | Creates parents, opens the file read/write (`0o600`). |
 | `user_documents_dir`    | `fn user_documents_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>`    | Computes the path. **No I/O.**                        |
 | `mk_user_documents_dir` | `fn mk_user_documents_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>` | Creates it (mode `0o755`) and returns the path.       |
 
@@ -159,12 +159,12 @@ extract("runtime.7z", "/tmp/runtime", &options)?;
 # Ok::<(), rust_sak::fs::FsError>(())
 ```
 
-| `ExtractProgress` field | Meaning                                                                                         |
-|-------------------------|-------------------------------------------------------------------------------------------------|
-| `entries: u64`          | Entries processed so far, counted on the same basis as `total_entries` — including skipped ones. |
-| `bytes: u64`            | Uncompressed bytes of file content written so far. Never decreases.                             |
-| `total_entries: Option<u64>` | What the archive's header says it holds.                                                    |
-| `total_bytes: Option<u64>`   | What the archive's header says its entries add up to.                                       |
+| `ExtractProgress` field      | Meaning                                                                                          |
+|------------------------------|--------------------------------------------------------------------------------------------------|
+| `entries: u64`               | Entries processed so far, counted on the same basis as `total_entries` — including skipped ones. |
+| `bytes: u64`                 | Uncompressed bytes of file content written so far. Never decreases.                              |
+| `total_entries: Option<u64>` | What the archive's header says it holds.                                                         |
+| `total_bytes: Option<u64>`   | What the archive's header says its entries add up to.                                            |
 
 The hook fires **inside** an entry as well as between entries. That is the point for an archive that is essentially one
 very large file — reporting only per entry would render such an expansion as a single jump from nothing to done.

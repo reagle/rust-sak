@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use super::Result;
-use super::user_dir::mk_user_dir_at;
+use super::user_dir::{DOCUMENTS_DIR_MODE, mk_user_dir_at};
 use super::user_documents_dir::documents_root;
 
 /// Creates an application's folder in the user's Documents, including any missing parents, and returns its path.
@@ -17,5 +17,5 @@ use super::user_documents_dir::documents_root;
 /// [`FsError::IllegalPath`](super::FsError::IllegalPath) if `name` or `sub_path` could escape it, and
 /// [`FsError::Io`](super::FsError::Io) if the directory could not be created.
 pub fn mk_user_documents_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf> {
-    mk_user_dir_at(&documents_root()?, name, sub_path.as_ref())
+    mk_user_dir_at(&documents_root()?, name, sub_path.as_ref(), DOCUMENTS_DIR_MODE)
 }

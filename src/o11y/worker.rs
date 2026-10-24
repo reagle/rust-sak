@@ -13,16 +13,25 @@ use super::{O11yError, Signal, gate, metric, otlp};
 /// The longest the worker will wait between attempts after repeated failures.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+/// The shortest first wait after a failure, whatever the flush interval.
+///
+/// The backoff starts at the flush interval, and a very short interval would otherwise mean retrying an unreachable
+/// collector in a tight loop.
+const MIN_BACKOFF: Duration = Duration::from_secs(1);
+
 /// Starts the export thread.
 ///
 /// It is a plain OS thread rather than a task on the calling application's runtime. The kernel schedules it
 /// independently, so serialising a batch and waiting on a TLS handshake never competes with the application's own
 /// work — and the module stays usable from a program that has no async runtime at all.
-pub(super) fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
+///
+/// # Errors
+///
+/// Returns the [`std::io::Error`] the OS gave for refusing to start the thread.
+pub(super) fn spawn(shared: Arc<Shared>) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("rust-sak-o11y".to_string())
         .spawn(move || run(shared))
-        .unwrap_or_else(|_| std::thread::spawn(|| {}))
 }
 
 /// The export loop.
@@ -41,6 +50,15 @@ fn run(shared: Arc<Shared>) {
     loop {
         let shutting_down = wait(&shared, backoff);
 
+        // Claimed at the start rather than the end: a request that arrives while this export is in flight is left
+        // standing, so it gets a cycle of its own that drains what was recorded after these buffers were taken.
+        {
+            let mut control = shared.control.lock().unwrap_or_else(PoisonError::into_inner);
+            control.flush_requested = false;
+            control.batch_ready = false;
+            control.started += 1;
+        }
+
         backoff = if export(&client, &shared) {
             Duration::ZERO
         } else {
@@ -50,7 +68,6 @@ fn run(shared: Arc<Shared>) {
 
         {
             let mut control = shared.control.lock().unwrap_or_else(PoisonError::into_inner);
-            control.flush_requested = false;
             control.generation += 1;
             shared.wake.notify_all();
         }
@@ -74,7 +91,7 @@ impl Drop for Sentinel {
 ///
 /// Three things end the wait: the flush interval elapsing, a producer pushing the record that reaches
 /// `max_batch_size`, and [`shutdown`](super::shutdown).
-fn wait(shared: &Shared, backoff: Duration) -> bool {
+pub(super) fn wait(shared: &Shared, backoff: Duration) -> bool {
     let deadline = Instant::now() + shared.config.flush_interval + backoff;
     let mut control = shared.control.lock().unwrap_or_else(PoisonError::into_inner);
 
@@ -83,7 +100,9 @@ fn wait(shared: &Shared, backoff: Duration) -> bool {
             return true;
         }
 
-        if control.flush_requested {
+        // A full batch cuts the wait short only while exports are succeeding: during a backoff it would turn a busy
+        // producer into a stream of attempts against a collector that is already failing.
+        if control.flush_requested || (control.batch_ready && backoff.is_zero()) {
             return false;
         }
 
@@ -157,7 +176,15 @@ fn post(client: &reqwest::blocking::Client, shared: &Shared, signal: Signal, pay
             report(shared, &O11yError::ExportRejected { signal, status, body });
             false
         }
-        Err(error) => {
+        Err(mut error) => {
+            // A `reqwest` error prints its URL, and this one is bound for someone else's logger: credentials the
+            // endpoint carries in its userinfo or query must not ride along.
+            if let Some(url) = error.url_mut() {
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                url.set_query(None);
+            }
+
             report(shared, &O11yError::Http(error));
             false
         }
@@ -176,10 +203,11 @@ fn report(shared: &Shared, error: &O11yError) {
     (shared.config.on_export_error)(error);
 }
 
-/// The next wait after a failure: double it, starting at the flush interval, capped at [`MAX_BACKOFF`].
+/// The next wait after a failure: double it, starting at the flush interval (but no less than [`MIN_BACKOFF`]),
+/// capped at [`MAX_BACKOFF`].
 fn next_backoff(current: Duration, flush_interval: Duration) -> Duration {
     if current.is_zero() {
-        return flush_interval.min(MAX_BACKOFF);
+        return flush_interval.clamp(MIN_BACKOFF, MAX_BACKOFF);
     }
 
     (current * 2).min(MAX_BACKOFF)

@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, DirBuilder, OpenOptions};
@@ -28,6 +29,11 @@ const DEFAULT_FILE_MODE: u32 = 0o644;
 /// link, and no mode to apply, so both degrade to a skip rather than an error.
 pub(super) struct ExtractRoot {
     dir: Dir,
+    /// Directories this root has already created, so an archive of many files in one folder does not repeat the
+    /// anchored, component-by-component `mkdir` for every entry. Extraction never removes a directory, so an entry
+    /// here stays true — and every later open is still resolved through `dir`, so a stale one could only fail, never
+    /// escape.
+    created: HashSet<PathBuf>,
 }
 
 impl ExtractRoot {
@@ -43,7 +49,10 @@ impl ExtractRoot {
         std::fs::create_dir_all(target_dir)?;
         let dir = Dir::open_ambient_dir(target_dir, ambient_authority())?;
 
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            created: HashSet::new(),
+        })
     }
 
     /// Creates a directory and any missing parents.
@@ -51,7 +60,24 @@ impl ExtractRoot {
     /// # Errors
     ///
     /// Returns [`FsError::Io`] if the path escapes the root or the directory cannot be created.
-    pub(super) fn create_dir(&self, path: &Path) -> Result<()> {
+    pub(super) fn create_dir(&mut self, path: &Path) -> Result<()> {
+        if self.created.contains(path) {
+            return Ok(());
+        }
+
+        self.create_dir_uncached(path)?;
+        // The create was recursive, so every ancestor exists now too.
+        for ancestor in path.ancestors().filter(|ancestor| !ancestor.as_os_str().is_empty()) {
+            if !self.created.insert(ancestor.to_path_buf()) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The anchored `mkdir -p` behind [`ExtractRoot::create_dir`].
+    fn create_dir_uncached(&self, path: &Path) -> Result<()> {
         let mut builder = DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
@@ -82,7 +108,7 @@ impl ExtractRoot {
     /// # Errors
     ///
     /// Returns [`FsError::Io`] if the path escapes the root or the file cannot be opened.
-    pub(super) fn create_file(&self, path: &Path, mode: Option<u32>) -> Result<cap_std::fs::File> {
+    pub(super) fn create_file(&mut self, path: &Path, mode: Option<u32>) -> Result<cap_std::fs::File> {
         if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             self.create_dir(parent)?;
         }
@@ -102,6 +128,17 @@ impl ExtractRoot {
             .map_err(|err| escape_or_io(err, path))
     }
 
+    /// Removes a file this root created, such as one left half-written by a failed entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError::Io`] if the file cannot be removed.
+    pub(super) fn remove_file(&self, path: &Path) -> Result<()> {
+        self.dir.remove_file(path)?;
+
+        Ok(())
+    }
+
     /// Creates a symbolic link, reporting `false` when the platform cannot make one safely.
     ///
     /// Windows has no contained symlink primitive in `cap-std`, and creating one through an ambient path would give
@@ -110,7 +147,7 @@ impl ExtractRoot {
     /// # Errors
     ///
     /// Returns [`FsError::Io`] if the path escapes the root or the link cannot be created.
-    pub(super) fn create_symlink(&self, path: &Path, target: &str) -> Result<bool> {
+    pub(super) fn create_symlink(&mut self, path: &Path, target: &str) -> Result<bool> {
         #[cfg(not(windows))]
         {
             if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {

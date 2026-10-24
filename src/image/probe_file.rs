@@ -15,6 +15,13 @@ use super::info::ImageInfo;
 /// is handled by re-reading it whole rather than by guessing a larger number here.
 const HEADER_PREFIX: u64 = 64 * 1024;
 
+/// The most a probe will ever read, when the prefix was not enough.
+///
+/// "Re-read it whole" has to stop somewhere: a multi-gigabyte file with the wrong extension would otherwise be loaded
+/// into memory just to report that it is not the image it claims to be. No real header or color profile comes near
+/// this.
+const MAX_PROBE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Reads the metadata of the image at `path` (dimensions, color type, bit depth, color profile) **without decoding the
 /// pixels**, selecting the codec from the file extension.
 ///
@@ -61,7 +68,7 @@ pub fn probe_file(path: impl AsRef<Path>) -> Result<ImageInfo> {
                 // found. Only the profile is read again, from the whole file.
                 Err(_) => {
                     let mut bytes = prefix;
-                    file.read_to_end(&mut bytes)?;
+                    read_rest_bounded(&mut file, &mut bytes)?;
                     container::color_profile(&bytes, format).unwrap_or_default()
                 }
             };
@@ -72,8 +79,16 @@ pub fn probe_file(path: impl AsRef<Path>) -> Result<ImageInfo> {
         // from complete input and so describes the actual problem.
         Err(_) => {
             let mut bytes = prefix;
-            file.read_to_end(&mut bytes)?;
+            read_rest_bounded(&mut file, &mut bytes)?;
             probe_with_format(&bytes, format)
         }
     }
+}
+
+/// Appends the rest of `file` to `bytes`, stopping once `bytes` holds [`MAX_PROBE_BYTES`].
+fn read_rest_bounded(file: &mut File, bytes: &mut Vec<u8>) -> std::io::Result<()> {
+    let room = MAX_PROBE_BYTES.saturating_sub(bytes.len() as u64);
+    file.take(room).read_to_end(bytes)?;
+
+    Ok(())
 }

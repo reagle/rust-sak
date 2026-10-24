@@ -98,9 +98,17 @@ fn transfer_file(
         return Ok(());
     }
 
-    // Copying a file onto itself would truncate it to nothing before reading a byte. This catches the literal case;
-    // two different spellings of the same path still collide, so transferring a directory into itself is unsupported.
-    if source == dest {
+    // Only regular files (or links to them) are copied. A walk reports a link to a directory, a FIFO or a socket as
+    // a file too, and `fs::copy` would fail on the first and block forever opening the second for a writer that never
+    // comes.
+    if !fs::metadata(source)?.is_file() {
+        summary.skipped += 1;
+        return Ok(());
+    }
+
+    // Copying a file onto itself would truncate it to nothing before reading a byte — and `./a`, a symlink, or a hard
+    // link all name the same file as `a` without being spelled like it, so the comparison is by identity.
+    if source == dest || is_same_file(source, dest)? {
         summary.skipped += 1;
         return Ok(());
     }
@@ -144,6 +152,32 @@ fn rename_or_copy(source: &Path, dest: &Path) -> Result<u64> {
             Ok(copied)
         }
         Err(err) => Err(err.into()),
+    }
+}
+
+/// Reports whether `dest` already exists and is the very file `source` is.
+///
+/// Compared by device and inode on Unix, which also catches a hard link; elsewhere by canonical path, since `std` has
+/// no stable file identity there.
+fn is_same_file(source: &Path, dest: &Path) -> Result<bool> {
+    let dest_meta = match fs::metadata(dest) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let source_meta = fs::metadata(source)?;
+        Ok(source_meta.dev() == dest_meta.dev() && source_meta.ino() == dest_meta.ino())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = dest_meta;
+        Ok(fs::canonicalize(source)? == fs::canonicalize(dest)?)
     }
 }
 

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use reqwest::StatusCode;
-use reqwest::header::{CONTENT_RANGE, ETAG, IF_RANGE, RANGE};
+use reqwest::header::{CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::watch;
 
@@ -101,7 +101,12 @@ impl Progress {
 #[derive(Debug)]
 pub struct Download {
     rx: watch::Receiver<Progress>,
-    handle: tokio::task::JoinHandle<Result<(), DownloadError>>,
+    /// Taken by whichever of [`Download::track`]/[`Download::join`] awaits it first: a finished task cannot be
+    /// awaited twice, and `None` is what lets the second call answer instead of panicking.
+    handle: Option<tokio::task::JoinHandle<Result<(), DownloadError>>>,
+    /// Whether the awaited task succeeded, once it has been awaited. Kept here rather than read off [`Progress`],
+    /// because a cancelled task never gets to mark itself failed.
+    succeeded: Option<bool>,
     /// Set once by the background task when a transfer it actually ran completes successfully. Shared rather than
     /// carried in [`Progress`], because a digest only exists at the end and an in-flight snapshot has nothing to say
     /// about it.
@@ -116,7 +121,12 @@ impl Download {
         handle: tokio::task::JoinHandle<Result<(), DownloadError>>,
         digest: Arc<OnceLock<String>>,
     ) -> Self {
-        Self { rx, handle, digest }
+        Self {
+            rx,
+            handle: Some(handle),
+            succeeded: None,
+            digest,
+        }
     }
 
     /// Returns the latest [`Progress`] snapshot (a cheap clone of the watched value).
@@ -171,10 +181,10 @@ impl Download {
     /// most one per 256 KiB or per 100 ms, and always a last one carrying the final byte count. So the callback fires
     /// often enough to drive a progress bar without its rate depending on how the server happened to frame the body.
     ///
-    /// The background task is awaited exactly once; this method returns its final result, so do **not** call
-    /// [`join`](Download::join) afterward (it would re-await a finished task and panic). Reading
-    /// [`progress`](Download::progress)/[`completed`](Download::completed)/[`failed`](Download::failed) afterward is
-    /// fine.
+    /// The background task is awaited exactly once, and this method returns its final result. Calling it again, or
+    /// [`join`](Download::join) afterward, does not panic — see [`join`](Download::join) for what a second call
+    /// returns. Reading [`progress`](Download::progress)/[`completed`](Download::completed)/[`failed`](Download::failed)
+    /// afterward is fine.
     ///
     /// # Errors
     ///
@@ -192,7 +202,7 @@ impl Download {
             let progress = self.rx.borrow_and_update().clone();
             callback(progress.total, progress.downloaded, progress.progress);
         }
-        join_handle(&mut self.handle).await
+        self.join_once().await
     }
 
     /// Cancels the download if it is still running; a no-op if it has already completed or errored.
@@ -202,10 +212,17 @@ impl Download {
     /// runs) but **nothing at the target path**, so a later [`DownloadMode::Resume`] picks the transfer up where it
     /// stopped and a [`DownloadMode::Skip`] correctly declines to treat it as finished.
     pub fn cancel(&self) {
-        self.handle.abort();
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
     }
 
     /// Awaits completion and returns the download's final result. Consumes the handle.
+    ///
+    /// After [`track`](Download::track) has already returned the result, this returns `Ok(())` for a download that
+    /// succeeded, and for one that failed or was cancelled a [`DownloadError::Io`] of kind
+    /// [`std::io::ErrorKind::Other`] saying the real error was handed to `track` — a [`DownloadError`] is not
+    /// [`Clone`], so it cannot be returned twice.
     ///
     /// # Errors
     ///
@@ -216,7 +233,22 @@ impl Download {
     ///
     /// Panics if the background task panicked (a bug), as distinct from being cancelled.
     pub async fn join(mut self) -> Result<(), DownloadError> {
-        join_handle(&mut self.handle).await
+        self.join_once().await
+    }
+
+    /// Awaits the task the first time it is called, and reports the already-returned outcome every time after.
+    async fn join_once(&mut self) -> Result<(), DownloadError> {
+        match (self.handle.take(), self.succeeded) {
+            (Some(mut handle), _) => {
+                let result = join_handle(&mut handle).await;
+                self.succeeded = Some(result.is_ok());
+                result
+            }
+            (None, Some(false)) => Err(DownloadError::Io(std::io::Error::other(
+                "the download did not succeed, and its error was already returned by an earlier track()",
+            ))),
+            (None, _) => Ok(()),
+        }
     }
 }
 
@@ -283,6 +315,42 @@ fn content_range_start(response: &reqwest::Response) -> Option<u64> {
     // RFC 9110 form: "bytes <start>-<end>/<complete-length|*>".
     let start = value.strip_prefix("bytes ")?.split('-').next()?;
     start.trim().parse::<u64>().ok()
+}
+
+/// Parses the complete length from a `416` response's `Content-Range` header (e.g. `bytes */4096` → `4096`).
+///
+/// Returns `None` when the header is absent or malformed, in which case the response says nothing about how long the
+/// resource is.
+fn unsatisfied_range_total(response: &reqwest::Response) -> Option<u64> {
+    let value = response.headers().get(CONTENT_RANGE)?.to_str().ok()?;
+    value.strip_prefix("bytes */")?.trim().parse::<u64>().ok()
+}
+
+/// Reports whether a failed attempt is worth another, for the download's retry loop.
+///
+/// HTTP failures follow the same rule as every other request ([`retry::is_transient`]). A disk failure that will
+/// only fail again — no permission, no space, a path that is not a directory — is final. Any other I/O error is
+/// retried; that includes the deliberate `InvalidData` raised after discarding a partial the server disowned, which is
+/// how the next attempt starts over from byte zero.
+fn is_retryable(err: &DownloadError) -> bool {
+    use std::io::ErrorKind;
+
+    match err {
+        DownloadError::Http(err) => retry::is_transient(err),
+        DownloadError::Io(err) => !matches!(
+            err.kind(),
+            ErrorKind::PermissionDenied
+                | ErrorKind::NotFound
+                | ErrorKind::ReadOnlyFilesystem
+                | ErrorKind::StorageFull
+                | ErrorKind::QuotaExceeded
+                | ErrorKind::FileTooLarge
+                | ErrorKind::IsADirectory
+                | ErrorKind::NotADirectory
+                | ErrorKind::InvalidInput
+        ),
+        DownloadError::Cancelled => false,
+    }
 }
 
 /// Computes the completion fraction, clamped to `0.0..=1.0`. `None` when the total is unknown; a known total of zero
@@ -379,9 +447,26 @@ async fn hash_prefix(
     Ok(hasher)
 }
 
-/// Reads a response's `ETag`, if it carried one that is valid UTF-8.
+/// Drops the carried hash, for every branch that truncates the partial it describes.
+///
+/// A checkpoint covering bytes that were just thrown away would otherwise be picked up by the next resume and folded
+/// into a digest of different content.
+fn forget(checkpoint: &Mutex<Option<(Hasher, u64)>>) {
+    *checkpoint.lock().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
+/// Reads a response's `ETag`, if it carried a **strong** one that is valid UTF-8.
+///
+/// Only a strong validator may be sent back as `If-Range` (RFC 9110 §13.1.5); a server receiving a weak one ignores
+/// the `Range` and answers `200`, so every resume would quietly restart from zero.
 fn response_etag(response: &reqwest::Response) -> Option<String> {
-    response.headers().get(ETAG)?.to_str().ok().map(str::to_owned)
+    let etag = response.headers().get(ETAG)?.to_str().ok()?;
+    (!etag.starts_with("W/")).then(|| etag.to_owned())
+}
+
+/// Reads a response's `Last-Modified`, if it carried one that is valid UTF-8.
+fn response_last_modified(response: &reqwest::Response) -> Option<String> {
+    response.headers().get(LAST_MODIFIED)?.to_str().ok().map(str::to_owned)
 }
 
 /// Streams the response body to `<path>.part`, retrying the whole transfer with Fibonacci backoff, and renames it onto
@@ -440,7 +525,10 @@ async fn stream_to_file(
     // bounded by one progress interval rather than by the size of the file.
     let checkpoint: Mutex<Option<(Hasher, u64)>> = Mutex::new(None);
 
-    retry::with_fibonacci_backoff(prepared.retries, || async {
+    // What a `429`/`503` asked the next attempt to wait, read while the response is still in hand.
+    let retry_after = retry::RetryAfter::default();
+
+    retry::with_fibonacci_backoff(prepared.retries, is_retryable, &retry_after, || async {
         // The offset is re-read each attempt, so a retry resumes from whatever is already on disk.
         let offset = match mode {
             DownloadMode::Overwrite => 0,
@@ -457,17 +545,35 @@ async fn stream_to_file(
         if offset > 0 {
             builder = builder.header(RANGE, format!("bytes={offset}-"));
             // The server-side half of the identity check, and the only one that can see bytes changing at a URL that
-            // did not: a resource that no longer matches the recorded `ETag` answers `200` rather than `206`, which
-            // the fresh-download branch below already handles as a restart.
-            if let Some(etag) = recorded.as_ref().and_then(|sidecar| sidecar.etag.clone()) {
-                builder = builder.header(IF_RANGE, etag);
+            // did not: a resource that no longer matches the recorded validator answers `200` rather than `206`, which
+            // the fresh-download branch below already handles as a restart. A strong `ETag` is preferred; the
+            // `Last-Modified` date is the validator `If-Range` accepts when there is none.
+            let validator = recorded
+                .as_ref()
+                .and_then(|sidecar| sidecar.etag.clone().or_else(|| sidecar.last_modified.clone()));
+            if let Some(validator) = validator {
+                builder = builder.header(IF_RANGE, validator);
             }
         }
         let response = builder.send().await?;
+        retry_after.record(&response);
 
-        // A `416` to a ranged request means the offset is at (or past) the end: the partial is the whole file, so it
-        // is promoted rather than transferred again.
+        // A `416` to a ranged request means the offset is at (or past) the end — which makes the partial the whole
+        // file only if the resource is exactly that long. One that has shrunk, or been replaced by something shorter,
+        // also answers `416`, so the length the response reports (or the sidecar recorded) has to agree first. A
+        // partial that disagrees is discarded, and the error sends the next attempt back to byte zero. When neither
+        // says how long the resource is, there is nothing to check against, and the partial is taken as complete.
         if offset > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            let total = unsatisfied_range_total(&response).or(recorded.as_ref().and_then(|sidecar| sidecar.total));
+            if total.is_some_and(|total| total != offset) {
+                partial::discard(&part, &sidecar).await?;
+                forget(&checkpoint);
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "server answered 416 for a partial whose length does not match the resource",
+                )));
+            }
+
             // The partial already is the whole artifact, so no byte of it streams past the hasher on this attempt:
             // whatever the checkpoint does not already cover is read back before the promotion moves it.
             let digest = match algorithm {
@@ -490,6 +596,7 @@ async fn stream_to_file(
         // (or a final failure) kicks in rather than writing bad bytes.
         if resuming && content_range_start(&response) != Some(offset) {
             tokio::fs::File::create(&part).await?;
+            forget(&checkpoint);
             return Err(DownloadError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "server returned a 206 whose Content-Range does not match the requested offset",
@@ -505,6 +612,7 @@ async fn stream_to_file(
             (BufWriter::new(handle), offset, total)
         } else {
             // A `200` (fresh download, or a server that ignored `Range`): truncate and start from byte zero.
+            forget(&checkpoint);
             (
                 BufWriter::new(tokio::fs::File::create(&part).await?),
                 0,
@@ -523,10 +631,12 @@ async fn stream_to_file(
 
         // A `206` need not repeat the `ETag`, so the recorded one carries forward; a `200` replaced the bytes, so only
         // what this response said still applies.
-        let etag = match response_etag(&response) {
-            Some(etag) => Some(etag),
-            None if resuming => recorded.and_then(|sidecar| sidecar.etag),
-            None => None,
+        let (etag, last_modified) = match recorded {
+            Some(recorded) if resuming => (
+                response_etag(&response).or(recorded.etag),
+                response_last_modified(&response).or(recorded.last_modified),
+            ),
+            _ => (response_etag(&response), response_last_modified(&response)),
         };
 
         // Written as soon as the response says what the `.part` will hold, so an interruption one chunk later already
@@ -536,6 +646,7 @@ async fn stream_to_file(
             &partial::Sidecar {
                 url: identity.url.clone(),
                 etag,
+                last_modified,
                 total,
                 resume_key: identity.resume_key.clone(),
             },

@@ -321,6 +321,177 @@ async fn post_is_retried_when_opted_in() {
     server.await.unwrap();
 }
 
+#[test]
+fn debug_output_never_shows_a_credential() {
+    let mut map = HeaderMap::new();
+    map.insert("x-api-key", "map-secret".parse().unwrap());
+
+    let fetch = Fetch::new()
+        .proxy(ProxySettings::new("http://proxy.example.com:3128").basic_auth("user", "proxy-secret"))
+        .header("Authorization", "Bearer header-secret");
+    let options = RequestOptions::new().headers(map);
+
+    let printed = format!("{fetch:?} {options:?}");
+    for secret in ["proxy-secret", "header-secret", "map-secret"] {
+        assert!(!printed.contains(secret), "{secret} leaked: {printed}");
+    }
+    assert!(
+        printed.contains("user"),
+        "the username is not a secret and helps debugging"
+    );
+}
+
+#[tokio::test]
+async fn a_client_error_is_not_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // One answer only: a retry would find the listener gone and fail with a connection error instead of the 404.
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response(&mut stream, "404 Not Found", "missing").await;
+    });
+
+    let err = Fetch::new()
+        .retries(3)
+        .text(format!("http://{addr}"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.status(), Some(reqwest::StatusCode::NOT_FOUND));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_the_json_asked_for_is_not_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response(&mut stream, "200 OK", "not json").await;
+    });
+
+    let err = Fetch::new()
+        .retries(3)
+        .json::<serde_json::Value>(format!("http://{addr}"))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&err, FetchError::Http(err) if err.is_decode()),
+        "expected the decode error itself, got {err:?}"
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_body_declared_over_the_limit_is_refused_and_not_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // One answer only: a retry would find the listener gone and fail with a connection error instead.
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response(&mut stream, "200 OK", "0123456789").await;
+    });
+
+    let err = Fetch::new()
+        .retries(3)
+        .max_body_bytes(4)
+        .text(format!("http://{addr}"))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, FetchError::BodyTooLarge { limit: 4 }), "got {err:?}");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_body_with_no_declared_length_is_cut_off_at_the_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response_no_length(&mut stream, "0123456789").await;
+    });
+
+    let err = Fetch::new()
+        .text_with_options(format!("http://{addr}"), RequestOptions::new().max_body_bytes(4))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, FetchError::BodyTooLarge { limit: 4 }), "got {err:?}");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_body_within_the_limit_decodes_as_before() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response_with_headers(&mut stream, &["X-Page: 2"], r#"{"name":"rust"}"#).await;
+    });
+
+    let page = Fetch::new()
+        .max_body_bytes(1024)
+        .json_response::<serde_json::Value>(format!("http://{addr}"))
+        .await
+        .unwrap();
+
+    assert_eq!(page.body["name"], "rust");
+    assert_eq!(
+        page.headers.get("x-page").unwrap(),
+        "2",
+        "headers survive the capped read"
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn retry_after_sets_the_wait_before_the_next_attempt() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        drop(stream);
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response(&mut stream, "200 OK", "recovered").await;
+    });
+
+    // The Fibonacci schedule would wait a full second before the retry; the server asked for none.
+    let started = std::time::Instant::now();
+    let body = Fetch::new().retries(1).text(format!("http://{addr}")).await.unwrap();
+
+    assert_eq!(body, "recovered");
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "Retry-After was ignored: took {:?}",
+        started.elapsed()
+    );
+    server.await.unwrap();
+}
+
 #[tokio::test]
 async fn read_timeout_errors_on_idle_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -339,7 +510,10 @@ async fn read_timeout_errors_on_idle_connection() {
         .await
         .unwrap_err();
 
-    assert!(err.is_timeout(), "expected a timeout error, got: {err}");
+    assert!(
+        matches!(&err, FetchError::Http(err) if err.is_timeout()),
+        "expected a timeout error, got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -619,6 +793,7 @@ async fn seed_partial(path: &Path, url: &str, bytes: &[u8], etag: Option<&str>, 
         &partial::Sidecar {
             url: reqwest::Url::parse(url).unwrap().to_string(),
             etag: etag.map(str::to_owned),
+            last_modified: None,
             total: None,
             resume_key: resume_key.map(str::to_owned),
         },
@@ -1088,6 +1263,53 @@ async fn resume_416_treated_as_complete() {
 
     // The complete partial was promoted rather than transferred again.
     assert_settled(&path, b"0123456789").await;
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn resume_416_for_a_different_length_discards_the_partial() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
+
+    // The resource is now 20 bytes, not the 10 on disk: a `416` alone must not crown the stale partial complete.
+    seed_partial(&path, &url, b"0123456789", None, None).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_range_not_satisfiable(&mut stream, 20).await;
+    });
+
+    let mut download = Fetch::new().download(&url, &path);
+    let progress = drain(&mut download).await;
+    server.await.unwrap();
+
+    assert!(progress.failed);
+    assert!(!path.exists(), "a stale partial was promoted");
+    assert!(!partial::part_path(&path).exists(), "the disowned partial was kept");
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn join_after_track_reports_instead_of_panicking() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    clean(&path).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response(&mut stream, "200 OK", "done").await;
+    });
+
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
+    download.track(|_, _, _| {}).await.unwrap();
+    download.join().await.unwrap();
+    server.await.unwrap();
+
     clean(&path).await;
 }
 

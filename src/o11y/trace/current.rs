@@ -34,7 +34,9 @@ pub fn current() -> Current {
 impl Current {
     /// Attaches an attribute to the open span, replacing any earlier value under the same key.
     pub fn set_attribute(&self, key: impl Into<Cow<'static, str>>, value: impl Into<Value>) {
-        context::with_current(|span| span.set_attribute(key.into(), value.into()));
+        // Converted before the stack is borrowed: a user's `From` impl is free to log, and logging reads the stack.
+        let (key, value) = (key.into(), value.into());
+        context::with_current(|span| span.set_attribute(key, value));
     }
 
     /// Records a point-in-time event on the open span.
@@ -44,7 +46,8 @@ impl Current {
 
     /// Records a point-in-time event carrying its own fields.
     pub fn add_event_with(&self, name: impl Into<Cow<'static, str>>, attributes: Fields) {
-        context::with_current(|span| span.add_event(name.into(), attributes));
+        let name = name.into();
+        context::with_current(|span| span.add_event(name, attributes));
     }
 
     /// Marks the open span as failed and records `error` on it, as an `exception` event carrying its `Display` form.
@@ -52,7 +55,9 @@ impl Current {
     /// The span exports with an error status (OTLP `status.code = 2`), which is how a trace backend tells a failed
     /// unit of work from one that merely logged something.
     pub fn set_error<E: std::error::Error + ?Sized>(&self, error: &E) {
-        context::with_current(|span| span.set_error(error.to_string()));
+        // Formatted before the stack is borrowed, for the same reason as in `set_attribute`.
+        let message = error.to_string();
+        context::with_current(|span| span.set_error(message));
     }
 
     /// Whether a span is open on this thread.

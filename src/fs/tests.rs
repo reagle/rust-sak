@@ -8,7 +8,7 @@ use super::extract::{Budget, EntryKind, permissions};
 use super::mk_user_config_file::mk_config_file_at;
 use super::safe_path::{validate_entry_name, validate_symlink_target};
 use super::un7zip::classify;
-use super::user_dir::{mk_user_dir_at, user_path};
+use super::user_dir::{CONFIG_DIR_MODE, DOCUMENTS_DIR_MODE, mk_user_dir_at, user_path};
 use super::*;
 
 /// Splits a validated entry name, panicking on rejection — for cases where acceptance is the precondition, not the
@@ -304,6 +304,20 @@ fn validate_symlink_target_rejects_climbing_above_the_root() {
 }
 
 #[test]
+fn validate_symlink_target_rejects_climbing_after_descending() {
+    // `d/..` stays level on paper, but `d` may be a link a later entry plants, so a climb after a name is refused.
+    for target in ["d/..", "a/../b", "./a/../../b", "a\\..\\b"] {
+        assert!(
+            matches!(
+                validate_symlink_target(&components("dir/link"), target),
+                Err(FsError::IllegalSymlink { .. })
+            ),
+            "should reject {target:?}"
+        );
+    }
+}
+
+#[test]
 fn validate_symlink_target_rejects_an_empty_or_nul_target() {
     assert!(matches!(
         validate_symlink_target(&components("link"), ""),
@@ -472,7 +486,7 @@ fn user_documents_dir_validates_like_the_config_dir() {
 fn mk_user_dir_at_creates_the_directory_and_its_parents() {
     let root = TempDir::new().unwrap();
 
-    let path = mk_user_dir_at(root.path(), "my-app", Path::new("a/b/c")).unwrap();
+    let path = mk_user_dir_at(root.path(), "my-app", Path::new("a/b/c"), DOCUMENTS_DIR_MODE).unwrap();
     assert!(path.is_dir());
     assert!(root.path().join("my-app").join("a").join("b").is_dir());
 }
@@ -481,8 +495,8 @@ fn mk_user_dir_at_creates_the_directory_and_its_parents() {
 fn mk_user_dir_at_succeeds_when_the_directory_already_exists() {
     let root = TempDir::new().unwrap();
 
-    let first = mk_user_dir_at(root.path(), "my-app", Path::new("themes")).unwrap();
-    let second = mk_user_dir_at(root.path(), "my-app", Path::new("themes")).unwrap();
+    let first = mk_user_dir_at(root.path(), "my-app", Path::new("themes"), DOCUMENTS_DIR_MODE).unwrap();
+    let second = mk_user_dir_at(root.path(), "my-app", Path::new("themes"), DOCUMENTS_DIR_MODE).unwrap();
     assert_eq!(first, second);
     assert!(second.is_dir());
 }
@@ -491,20 +505,24 @@ fn mk_user_dir_at_succeeds_when_the_directory_already_exists() {
 fn mk_user_dir_at_creates_nothing_for_an_illegal_path() {
     let root = TempDir::new().unwrap();
 
-    assert!(mk_user_dir_at(root.path(), "my-app", Path::new("../escape")).is_err());
+    assert!(mk_user_dir_at(root.path(), "my-app", Path::new("../escape"), DOCUMENTS_DIR_MODE).is_err());
     assert!(!root.path().join("my-app").exists());
 }
 
 #[cfg(unix)]
 #[test]
-fn mk_user_dir_at_uses_mode_0755() {
+fn mk_user_dir_at_applies_the_mode_it_is_given() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = TempDir::new().unwrap();
 
-    let path = mk_user_dir_at(root.path(), "my-app", Path::new("themes")).unwrap();
-    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o755, "unexpected mode {mode:o}");
+    let documents = mk_user_dir_at(root.path(), "my-app", Path::new("themes"), DOCUMENTS_DIR_MODE).unwrap();
+    let mode = fs::metadata(&documents).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755, "unexpected documents mode {mode:o}");
+
+    let config = mk_user_dir_at(root.path(), "other-app", Path::new("secrets"), CONFIG_DIR_MODE).unwrap();
+    let mode = fs::metadata(&config).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "unexpected config mode {mode:o}");
 }
 
 #[test]
@@ -560,7 +578,7 @@ fn mk_config_file_at_rejects_a_path_that_names_no_file() {
 
 #[cfg(unix)]
 #[test]
-fn mk_config_file_at_uses_mode_0644() {
+fn mk_config_file_at_is_private_to_the_owner() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = TempDir::new().unwrap();
@@ -568,7 +586,9 @@ fn mk_config_file_at_uses_mode_0644() {
     mk_config_file_at(root.path(), "my-app", Path::new("config.toml")).unwrap();
     let path = root.path().join("my-app").join("config.toml");
     let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o644, "unexpected mode {mode:o}");
+    assert_eq!(mode, 0o600, "unexpected mode {mode:o}");
+    let mode = fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "unexpected directory mode {mode:o}");
 }
 
 #[cfg(unix)]
@@ -580,12 +600,13 @@ fn mk_config_file_at_leaves_an_existing_files_mode_alone() {
     let path = user_path(root.path(), "my-app", Path::new("config.toml")).unwrap();
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, b"secret").unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    // Something other than the default, so leaving it alone is distinguishable from re-applying it.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
 
     mk_config_file_at(root.path(), "my-app", Path::new("config.toml")).unwrap();
 
     let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "unexpected mode {mode:o}");
+    assert_eq!(mode, 0o640, "unexpected mode {mode:o}");
 }
 
 // --- list_path tests ---
@@ -1003,6 +1024,39 @@ fn copy_files_skips_a_file_that_would_be_copied_onto_itself() {
         }
     );
     assert_eq!(fs::read_to_string(&source).unwrap(), "a");
+}
+
+#[test]
+fn copy_files_skips_a_file_onto_itself_under_another_spelling() {
+    let from = copy_fixture();
+    let source = from.path().join("a.txt");
+
+    // `dir/.` names the same directory as `dir` without comparing equal to it as a path.
+    let summary = copy_files([&source], from.path().join("."), &CopyOptions::new()).unwrap();
+
+    assert_eq!(summary.skipped, 1);
+    assert_eq!(fs::read_to_string(&source).unwrap(), "a", "the source was truncated");
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_files_skips_what_is_not_a_regular_file() {
+    let from = TempDir::new().unwrap();
+    let to = TempDir::new().unwrap();
+    fs::write(from.path().join("file.txt"), "kept").unwrap();
+    fs::create_dir(from.path().join("real")).unwrap();
+    std::os::unix::fs::symlink(from.path().join("real"), from.path().join("linked-dir")).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(from.path().join("pipe"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+
+    // A FIFO used to block this call forever, waiting on a writer; a directory link used to fail it outright.
+    let summary = copy_files([from.path()], to.path(), &CopyOptions::new()).unwrap();
+
+    assert_eq!(summary.files, 1);
+    assert_eq!(summary.skipped, 2);
 }
 
 // --- move_files tests ---
@@ -1837,6 +1891,43 @@ fn unzip_rejects_a_symlink_chained_through_another_symlink() {
 
 #[cfg(unix)]
 #[test]
+fn unzip_rejects_a_symlink_that_escapes_only_once_a_later_link_exists() {
+    // The reverse of the chained case above: when `c` is created, `d` does not exist, so `c` dangles — legal — and
+    // only `d` → `.` arriving afterwards makes `c` land in the root's parent.
+    let entries = [TestEntry::symlink("c", "d/.."), TestEntry::symlink("d", ".")];
+
+    let (result, sandbox) = unzip_entries(&entries, &ExtractOptions::new());
+
+    assert!(matches!(result, Err(FsError::IllegalSymlink { .. })), "got {result:?}");
+    assert!(
+        fs::symlink_metadata(sandbox.target().join("c")).is_err(),
+        "the escaping link must not be left behind"
+    );
+    sandbox.assert_nothing_escaped();
+}
+
+#[cfg(unix)]
+#[test]
+fn unzip_does_not_leave_a_directory_world_writable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A file's mode passes through the umask on `open`; a directory's is applied with `chmod` afterwards, so the
+    // extractor masks it itself.
+    let entries = [TestEntry::dir_with_mode("shared/", 0o777)];
+
+    let (result, sandbox) = unzip_entries(&entries, &ExtractOptions::new());
+    result.unwrap();
+
+    let mode = fs::metadata(sandbox.target().join("shared"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o755, "unexpected mode {mode:o}");
+}
+
+#[cfg(unix)]
+#[test]
 fn unzip_refuses_to_write_through_a_symlink_already_in_the_target() {
     // The target directory is the caller's, and may already contain anything — including a link pointing out of it.
     // The entry name `link/pwned` is impeccable; only resolving it through the anchored handle reveals the escape.
@@ -2116,6 +2207,50 @@ fn untar_entries(entries: &[TestEntry], options: &ExtractOptions) -> (Result<Ext
 }
 
 #[test]
+fn untar_xz_reads_every_stream_of_a_multi_stream_file() {
+    use std::io::Write as _;
+
+    // What `pixz` and plain concatenation produce: one TAR, split across two independent xz streams.
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, contents) in [("first.txt", "one"), ("second.txt", "two")] {
+        let header = tar_header(name, contents.len() as u64, 0o644, tar::EntryType::Regular);
+        builder.append(&header, contents.as_bytes()).unwrap();
+    }
+    let tar_bytes = builder.into_inner().unwrap();
+
+    let (head, tail) = tar_bytes.split_at(512 * 2);
+    let mut xz = Vec::new();
+    for part in [head, tail] {
+        let mut encoder = liblzma::write::XzEncoder::new(Vec::new(), 1);
+        encoder.write_all(part).unwrap();
+        xz.extend(encoder.finish().unwrap());
+    }
+    let archive = archive_file(&xz, ".tar.xz");
+    let sandbox = Sandbox::new();
+
+    let summary = untar_xz(archive.path(), sandbox.target(), &ExtractOptions::new()).unwrap();
+
+    assert_eq!(summary.files, 2);
+    assert_eq!(fs::read_to_string(sandbox.target().join("second.txt")).unwrap(), "two");
+}
+
+#[test]
+fn untar_xz_skips_a_hard_link_whose_target_is_not_utf8() {
+    // The target is never read for a hard link, so it must not be able to fail the extraction.
+    let mut header = tar_header("hard", 0, 0o644, tar::EntryType::Link);
+    header.as_mut_bytes()[157..159].copy_from_slice(&[0xff, 0xfe]);
+    header.set_cksum();
+    let mut builder = tar::Builder::new(liblzma::write::XzEncoder::new(Vec::new(), 1));
+    builder.append(&header, io::empty()).unwrap();
+    let archive = archive_file(&builder.into_inner().unwrap().finish().unwrap(), ".tar.xz");
+    let sandbox = Sandbox::new();
+
+    let summary = untar_xz(archive.path(), sandbox.target(), &ExtractOptions::new()).unwrap();
+
+    assert_eq!(summary.skipped, 1);
+}
+
+#[test]
 fn untar_xz_extracts_files_and_directories() {
     let entries = [
         TestEntry::dir("docs/"),
@@ -2354,6 +2489,32 @@ fn un7zip_extracts_files_and_directories() {
         fs::read_to_string(sandbox.target().join("docs/readme.txt")).unwrap(),
         "hello"
     );
+    sandbox.assert_nothing_escaped();
+}
+
+#[test]
+fn un7zip_keeps_a_solid_stream_aligned_past_a_skipped_entry() {
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
+
+    // One solid block: every entry is a window onto the same decoder stream. The first names the target itself, so
+    // it is skipped without its bytes being read — and those bytes must not end up at the front of the next file.
+    let mut writer = ArchiveWriter::new(io::Cursor::new(Vec::new())).unwrap();
+    writer
+        .push_archive_entries(
+            vec![ArchiveEntry::new_file("."), ArchiveEntry::new_file("next.txt")],
+            vec![
+                SourceReader::new(b"skipped bytes".as_slice()),
+                SourceReader::new(b"next".as_slice()),
+            ],
+        )
+        .unwrap();
+    let archive = archive_file(&writer.finish().unwrap().into_inner(), ".7z");
+    let sandbox = Sandbox::new();
+
+    let summary = un7zip(archive.path(), sandbox.target(), &ExtractOptions::new()).unwrap();
+
+    assert_eq!(summary.skipped, 1);
+    assert_eq!(fs::read_to_string(sandbox.target().join("next.txt")).unwrap(), "next");
     sandbox.assert_nothing_escaped();
 }
 

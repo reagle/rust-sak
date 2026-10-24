@@ -15,6 +15,7 @@
 
 mod digest;
 mod download;
+mod error;
 mod partial;
 mod prepared;
 mod proxy;
@@ -27,7 +28,7 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 
-// Re-exported because this module's public API is stated in `reqwest`'s types: every request method reports a
+// Re-exported because this module's public API is stated in `reqwest`'s types: every request failure carries a
 // `reqwest::Error`, `Response::status` is a `reqwest::StatusCode` and `Response::headers` a `reqwest::header::HeaderMap`.
 // Without this a consumer cannot name what it is handed without depending on `reqwest` itself and keeping the version
 // aligned with this crate's — and two versions would make these two unrelated types.
@@ -35,6 +36,7 @@ pub use reqwest;
 
 pub use digest::DigestAlgorithm;
 pub use download::{Download, DownloadError, DownloadMode, Progress};
+pub use error::FetchError;
 pub use proxy::ProxySettings;
 pub use request::RequestOptions;
 pub use response::Response;
@@ -83,6 +85,9 @@ pub struct Fetch {
     /// Default [`DownloadMode`] for [`Fetch::download`], overridable per request via
     /// [`RequestOptions::download_mode`]. Defaults to [`DownloadMode::Resume`].
     download_mode: DownloadMode,
+    /// The largest response body the `text` and `json` methods will read, overridable per request via
+    /// [`RequestOptions::max_body_bytes`]. `None`, the default, reads any size.
+    max_body_bytes: Option<u64>,
     /// Lazily built, reused HTTP client. Cleared by the config builders, so the next request rebuilds it.
     client: OnceLock<reqwest::Client>,
 }
@@ -99,6 +104,7 @@ impl Default for Fetch {
             connect_timeout: None,
             proxy: ProxyMode::Detect,
             download_mode: DownloadMode::Resume,
+            max_body_bytes: None,
             client: OnceLock::new(),
         }
     }
@@ -116,6 +122,7 @@ impl Clone for Fetch {
             connect_timeout: self.connect_timeout,
             proxy: self.proxy.clone(),
             download_mode: self.download_mode,
+            max_body_bytes: self.max_body_bytes,
             client: OnceLock::new(),
         }
     }
@@ -150,13 +157,18 @@ impl Fetch {
     }
 
     /// Replaces the full set of headers.
-    pub fn headers(mut self, headers: HeaderMap) -> Self {
+    pub fn headers(mut self, mut headers: HeaderMap) -> Self {
+        mark_credentials(&mut headers);
         self.headers = headers;
         self.client = OnceLock::new();
         self
     }
 
     /// Sets the number of retry attempts for failed requests.
+    ///
+    /// Only failures that another attempt could fix are retried: connection errors, timeouts, a body cut off
+    /// mid-transfer, and `5xx`, `408` and `429` responses. Any other `4xx`, or a body that is not the JSON asked for,
+    /// is returned at once, since resending the same request would get the same answer.
     pub fn retries(mut self, retries: u32) -> Self {
         self.retries = retries;
         self
@@ -215,8 +227,8 @@ impl Fetch {
     /// platform, plus the system proxy settings on macOS and Windows. Call this only to override that; call
     /// [`Fetch::no_proxy`] to switch it off entirely.
     ///
-    /// An invalid proxy URL is not rejected here — it surfaces as the [`reqwest::Error`] from the first request, which
-    /// is where the client is built.
+    /// An invalid proxy URL is not rejected here — it surfaces as the [`reqwest::Error`] inside the first request's
+    /// [`FetchError::Http`] or [`DownloadError::Http`], since that is where the client is built.
     ///
     /// ```
     /// use rust_sak::fetch::{Fetch, ProxySettings};
@@ -260,6 +272,25 @@ impl Fetch {
         self
     }
 
+    /// Caps the response body the `text` and `json` methods will read. `None` (the default) reads any size.
+    ///
+    /// Those methods hold the whole body in memory, so without a cap a server that answers with an endless stream —
+    /// hostile, or merely broken — can exhaust it. A body over the limit fails with [`FetchError::BodyTooLarge`]: at
+    /// once when its `Content-Length` already says so, otherwise as soon as the bytes read pass the limit. It is not
+    /// retried, since the same request would get the same body. Overridable per request via
+    /// [`RequestOptions::max_body_bytes`]; [`Fetch::download`] streams to disk and ignores it. Like
+    /// [`Fetch::retries`], this does not rebuild the cached client.
+    ///
+    /// ```
+    /// use rust_sak::fetch::Fetch;
+    ///
+    /// let fetch = Fetch::new().max_body_bytes(16 << 20);
+    /// ```
+    pub fn max_body_bytes(mut self, limit: impl Into<Option<u64>>) -> Self {
+        self.max_body_bytes = limit.into();
+        self
+    }
+
     /// Returns the cached HTTP client, building it from the current configuration on first use.
     ///
     /// The struct's headers become the client's default headers; the HTTP/2 toggle, the read and connect timeouts
@@ -296,39 +327,48 @@ impl Fetch {
     /// Sends a prepared request with retries and captures the whole response: its status, its headers, and
     /// whatever `extract` makes of its body.
     ///
-    /// The one place the request pipeline is written. Everything that accretes here later — honouring `Retry-After`,
-    /// retrying only on 5xx, a per-attempt timeout, a span around each attempt — lands once rather than in the four
-    /// public methods that used to spell this out individually.
+    /// The one place the request pipeline is written. Everything that accretes here later — a per-attempt timeout, a
+    /// span around each attempt — lands once rather than in the public methods. Which failures are worth retrying is
+    /// [`is_retryable`]'s call, and a `Retry-After` on a `429` or `503` sets the wait before the next attempt.
     ///
     /// # Errors
     ///
-    /// Returns a [`reqwest::Error`] if the request cannot be prepared, every attempt fails, or the response carries
-    /// a non-success status.
+    /// Returns a [`FetchError`] if the request cannot be prepared, every attempt fails, the response carries a
+    /// non-success status, or the body is larger than the resolved `max_body_bytes`.
     async fn send_retrying<T, Fut>(
         &self,
         url: impl reqwest::IntoUrl,
         options: RequestOptions,
         extract: impl Fn(reqwest::Response) -> Fut,
-    ) -> Result<Response<T>, reqwest::Error>
+    ) -> Result<Response<T>, FetchError>
     where
         Fut: Future<Output = Result<T, reqwest::Error>>,
     {
         let prepared = self.prepare(url, options)?;
+        let retry_after = retry::RetryAfter::default();
 
-        retry::with_fibonacci_backoff(prepared.retries, || async {
-            let mut response = prepared.request().send().await?.error_for_status()?;
-
-            // Taken before the body, which consumes the response. Moved rather than cloned: the response is dropped
-            // either way, so nothing observes the emptied map, and a paginating caller is not copying a header map
-            // per page for no one.
+        retry::with_fibonacci_backoff(prepared.retries, is_retryable, &retry_after, || async {
+            let response = prepared.request().send().await?;
+            retry_after.record(&response);
+            let mut response = response.error_for_status()?;
             let status = response.status();
-            let headers = std::mem::take(response.headers_mut());
 
-            Ok(Response {
-                body: extract(response).await?,
-                status,
-                headers,
-            })
+            let (headers, body) = match prepared.max_body_bytes {
+                // Taken before the body, which consumes the response. Moved rather than cloned: the response is
+                // dropped either way, so nothing observes the emptied map, and a paginating caller is not copying a
+                // header map per page for no one.
+                None => {
+                    let headers = std::mem::take(response.headers_mut());
+                    (headers, extract(response).await?)
+                }
+                // Cloned here, because the rebuilt response needs its own copy to decode the body the same way.
+                Some(limit) => {
+                    let headers = response.headers().clone();
+                    (headers, extract(read_capped(response, limit).await?).await?)
+                }
+            };
+
+            Ok(Response { body, status, headers })
         })
         .await
     }
@@ -363,6 +403,7 @@ impl Fetch {
             headers: options.headers,
             body: options.body,
             retries,
+            max_body_bytes: options.max_body_bytes.or(self.max_body_bytes),
         })
     }
 
@@ -373,18 +414,18 @@ impl Fetch {
     ///
     /// # Errors
     ///
-    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
-    /// is not valid UTF-8 text.
+    /// Returns the last [`FetchError`] if the client cannot be built, every attempt fails, the response body is not
+    /// valid UTF-8 text, or it is larger than [`Fetch::max_body_bytes`] allows.
     ///
     /// ```no_run
-    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// # async fn run() -> Result<(), rust_sak::fetch::FetchError> {
     /// use rust_sak::fetch::Fetch;
     ///
     /// let body = Fetch::new().text("https://example.com").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn text(&self, url: impl reqwest::IntoUrl) -> Result<String, reqwest::Error> {
+    pub async fn text(&self, url: impl reqwest::IntoUrl) -> Result<String, FetchError> {
         self.text_with_options(url, RequestOptions::default()).await
     }
 
@@ -398,11 +439,11 @@ impl Fetch {
     ///
     /// # Errors
     ///
-    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
-    /// is not valid UTF-8 text.
+    /// Returns the last [`FetchError`] if the client cannot be built, every attempt fails, the response body is not
+    /// valid UTF-8 text, or it is larger than [`Fetch::max_body_bytes`] allows.
     ///
     /// ```no_run
-    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// # async fn run() -> Result<(), rust_sak::fetch::FetchError> {
     /// use rust_sak::fetch::{Fetch, RequestOptions};
     ///
     /// let body = Fetch::new()
@@ -415,7 +456,7 @@ impl Fetch {
         &self,
         url: impl reqwest::IntoUrl,
         options: RequestOptions,
-    ) -> Result<String, reqwest::Error> {
+    ) -> Result<String, FetchError> {
         Ok(self.text_response_with_options(url, options).await?.body)
     }
 
@@ -426,11 +467,11 @@ impl Fetch {
     ///
     /// # Errors
     ///
-    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
-    /// cannot be deserialized into `T`.
+    /// Returns the last [`FetchError`] if the client cannot be built, every attempt fails, the response body cannot be
+    /// deserialized into `T`, or it is larger than [`Fetch::max_body_bytes`] allows.
     ///
     /// ```no_run
-    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// # async fn run() -> Result<(), rust_sak::fetch::FetchError> {
     /// use rust_sak::fetch::Fetch;
     ///
     /// #[derive(serde::Deserialize)]
@@ -446,7 +487,7 @@ impl Fetch {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn json<T: serde::de::DeserializeOwned>(&self, url: impl reqwest::IntoUrl) -> Result<T, reqwest::Error> {
+    pub async fn json<T: serde::de::DeserializeOwned>(&self, url: impl reqwest::IntoUrl) -> Result<T, FetchError> {
         self.json_with_options(url, RequestOptions::default()).await
     }
 
@@ -458,11 +499,11 @@ impl Fetch {
     ///
     /// # Errors
     ///
-    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
-    /// cannot be deserialized into `T`.
+    /// Returns the last [`FetchError`] if the client cannot be built, every attempt fails, the response body cannot be
+    /// deserialized into `T`, or it is larger than [`Fetch::max_body_bytes`] allows.
     ///
     /// ```no_run
-    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// # async fn run() -> Result<(), rust_sak::fetch::FetchError> {
     /// use rust_sak::fetch::{Fetch, RequestOptions};
     ///
     /// #[derive(serde::Deserialize)]
@@ -482,7 +523,7 @@ impl Fetch {
         &self,
         url: impl reqwest::IntoUrl,
         options: RequestOptions,
-    ) -> Result<T, reqwest::Error> {
+    ) -> Result<T, FetchError> {
         Ok(self.json_response_with_options(url, options).await?.body)
     }
 
@@ -494,11 +535,11 @@ impl Fetch {
     ///
     /// # Errors
     ///
-    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
-    /// is not valid UTF-8 text.
+    /// Returns the last [`FetchError`] if the client cannot be built, every attempt fails, the response body is not
+    /// valid UTF-8 text, or it is larger than [`Fetch::max_body_bytes`] allows.
     ///
     /// ```no_run
-    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// # async fn run() -> Result<(), rust_sak::fetch::FetchError> {
     /// use rust_sak::fetch::Fetch;
     ///
     /// let fetch = Fetch::new();
@@ -513,7 +554,7 @@ impl Fetch {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn text_response(&self, url: impl reqwest::IntoUrl) -> Result<Response<String>, reqwest::Error> {
+    pub async fn text_response(&self, url: impl reqwest::IntoUrl) -> Result<Response<String>, FetchError> {
         self.text_response_with_options(url, RequestOptions::default()).await
     }
 
@@ -526,11 +567,11 @@ impl Fetch {
     ///
     /// # Errors
     ///
-    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
-    /// is not valid UTF-8 text.
+    /// Returns the last [`FetchError`] if the client cannot be built, every attempt fails, the response body is not
+    /// valid UTF-8 text, or it is larger than [`Fetch::max_body_bytes`] allows.
     ///
     /// ```no_run
-    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// # async fn run() -> Result<(), rust_sak::fetch::FetchError> {
     /// use rust_sak::fetch::{Fetch, RequestOptions};
     ///
     /// let page = Fetch::new()
@@ -545,7 +586,7 @@ impl Fetch {
         &self,
         url: impl reqwest::IntoUrl,
         options: RequestOptions,
-    ) -> Result<Response<String>, reqwest::Error> {
+    ) -> Result<Response<String>, FetchError> {
         self.send_retrying(url, options, reqwest::Response::text).await
     }
 
@@ -557,11 +598,11 @@ impl Fetch {
     ///
     /// # Errors
     ///
-    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
-    /// cannot be deserialized into `T`.
+    /// Returns the last [`FetchError`] if the client cannot be built, every attempt fails, the response body cannot be
+    /// deserialized into `T`, or it is larger than [`Fetch::max_body_bytes`] allows.
     ///
     /// ```no_run
-    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// # async fn run() -> Result<(), rust_sak::fetch::FetchError> {
     /// use rust_sak::fetch::Fetch;
     ///
     /// #[derive(serde::Deserialize)]
@@ -577,7 +618,7 @@ impl Fetch {
     pub async fn json_response<T: serde::de::DeserializeOwned>(
         &self,
         url: impl reqwest::IntoUrl,
-    ) -> Result<Response<T>, reqwest::Error> {
+    ) -> Result<Response<T>, FetchError> {
         self.json_response_with_options(url, RequestOptions::default()).await
     }
 
@@ -588,11 +629,11 @@ impl Fetch {
     ///
     /// # Errors
     ///
-    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
-    /// cannot be deserialized into `T`.
+    /// Returns the last [`FetchError`] if the client cannot be built, every attempt fails, the response body cannot be
+    /// deserialized into `T`, or it is larger than [`Fetch::max_body_bytes`] allows.
     ///
     /// ```no_run
-    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// # async fn run() -> Result<(), rust_sak::fetch::FetchError> {
     /// use rust_sak::fetch::{Fetch, RequestOptions};
     ///
     /// #[derive(serde::Deserialize)]
@@ -610,7 +651,7 @@ impl Fetch {
         &self,
         url: impl reqwest::IntoUrl,
         options: RequestOptions,
-    ) -> Result<Response<T>, reqwest::Error> {
+    ) -> Result<Response<T>, FetchError> {
         self.send_retrying(url, options, reqwest::Response::json::<T>).await
     }
 
@@ -725,6 +766,55 @@ impl Fetch {
     }
 }
 
+/// Reports whether a failed `text`/`json` attempt is worth another. A body over the limit will be over it again;
+/// everything else is [`retry::is_transient`]'s call.
+fn is_retryable(err: &FetchError) -> bool {
+    match err {
+        FetchError::Http(err) => retry::is_transient(err),
+        FetchError::BodyTooLarge { .. } => false,
+    }
+}
+
+/// Reads `response`'s body, refusing one larger than `limit`, and hands it back as a response of its own.
+///
+/// The body is read here, under the limit, rather than by `reqwest`'s own `text`/`json`, which read whatever arrives.
+/// Rebuilding a `reqwest::Response` around the bytes is what lets those same methods decode them afterwards: the
+/// charset from `Content-Type`, the JSON errors, everything a caller already relies on, stays exactly as it was.
+///
+/// # Errors
+///
+/// Returns [`FetchError::BodyTooLarge`] when `Content-Length` already exceeds `limit` or the bytes read pass it, and
+/// [`FetchError::Http`] if the body stream fails.
+async fn read_capped(response: reqwest::Response, limit: u64) -> Result<reqwest::Response, FetchError> {
+    use futures_util::StreamExt;
+
+    // Refused before a byte is read when the server has already said how much is coming.
+    if response.content_length().is_some_and(|length| length > limit) {
+        return Err(FetchError::BodyTooLarge { limit });
+    }
+
+    let (status, version, headers) = (response.status(), response.version(), response.headers().clone());
+
+    // The `Content-Length` check is not enough on its own: a chunked body declares nothing, and a decompressed one
+    // can be far larger than the length the server declared.
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len() as u64 + chunk.len() as u64 > limit {
+            return Err(FetchError::BodyTooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let mut rebuilt = http::Response::new(body);
+    *rebuilt.status_mut() = status;
+    *rebuilt.version_mut() = version;
+    *rebuilt.headers_mut() = headers;
+
+    Ok(reqwest::Response::from(rebuilt))
+}
+
 /// Inserts `key`/`value` into `map`, converting both and panicking on invalid input. Shared by the `header` builder
 /// methods on [`Fetch`] and [`RequestOptions`].
 ///
@@ -739,8 +829,38 @@ where
     V::Error: std::fmt::Debug,
 {
     let key = key.try_into().expect("invalid header name");
-    let value = value.try_into().expect("invalid header value");
+    let mut value: reqwest::header::HeaderValue = value.try_into().expect("invalid header value");
+    value.set_sensitive(is_credential(&key));
     map.insert(key, value);
+}
+
+/// Marks every credential-bearing value in `map` as sensitive. Applied to a header map handed over whole, where
+/// [`insert_header`] never saw the values go in.
+///
+/// A sensitive value prints as `Sensitive` in a [`HeaderMap`]'s `Debug` output — which [`Fetch`] and
+/// [`RequestOptions`] both derive — and is kept out of HTTP/2's header-compression table.
+fn mark_credentials(map: &mut HeaderMap) {
+    for (name, value) in map.iter_mut() {
+        if is_credential(name) {
+            value.set_sensitive(true);
+        }
+    }
+}
+
+/// `true` for a header whose value is a credential: the standard authentication headers, plus the conventional
+/// names APIs give their keys and tokens.
+fn is_credential(name: &reqwest::header::HeaderName) -> bool {
+    use reqwest::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION};
+
+    if [AUTHORIZATION, PROXY_AUTHORIZATION, COOKIE].contains(name) {
+        return true;
+    }
+
+    // Header names are stored lowercase, so the comparison needs no folding.
+    let name = name.as_str();
+    ["token", "secret", "password", "api-key", "apikey"]
+        .iter()
+        .any(|word| name.contains(word))
 }
 
 /// `true` for HTTP methods that are idempotent per RFC 9110 (so safe to retry automatically): `GET`, `HEAD`, `PUT`,

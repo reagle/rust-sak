@@ -6,9 +6,16 @@ use std::path::{Path, PathBuf};
 use super::safe_path::validate_entry_name;
 use super::{FsError, Result};
 
-/// The mode new per-application directories are created with: readable and traversable by all, writable by the owner.
-#[cfg(unix)]
-const DIR_MODE: u32 = 0o755;
+/// The mode new configuration directories are created with: private to the owner.
+///
+/// Configuration routinely holds API keys, tokens and session cookies, so on a shared machine nobody else should be
+/// able to list or read it.
+pub(super) const CONFIG_DIR_MODE: u32 = 0o700;
+
+/// The mode new Documents directories are created with: readable and traversable by all, writable by the owner.
+///
+/// A Documents folder is where a user expects to find, and share, what an application saved for them.
+pub(super) const DOCUMENTS_DIR_MODE: u32 = 0o755;
 
 /// Joins `root`, `name` and `sub_path` after validating the latter two.
 ///
@@ -48,18 +55,21 @@ pub(super) fn user_path(root: &Path, name: &str, sub_path: &Path) -> Result<Path
 ///
 /// The testable half of [`mk_user_config_dir`](super::mk_user_config_dir) and
 /// [`mk_user_documents_dir`](super::mk_user_documents_dir), so the suite can create directories under a temporary
-/// root rather than the real one. Directories are created with mode `0o755` on Unix; an existing one is left alone.
+/// root rather than the real one. Missing directories are created with `mode` on Unix — [`CONFIG_DIR_MODE`] or
+/// [`DOCUMENTS_DIR_MODE`] — and an existing one is left alone.
 ///
 /// # Errors
 ///
 /// As [`user_path`], plus [`FsError::Io`] if the directory could not be created.
-pub(super) fn mk_user_dir_at(root: &Path, name: &str, sub_path: &Path) -> Result<PathBuf> {
+pub(super) fn mk_user_dir_at(root: &Path, name: &str, sub_path: &Path, mode: u32) -> Result<PathBuf> {
     let path = user_path(root, name, sub_path)?;
 
     let mut builder = DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
-    builder.mode(DIR_MODE);
+    builder.mode(mode);
+    #[cfg(not(unix))]
+    let _ = mode;
     builder.create(&path)?;
 
     Ok(path)

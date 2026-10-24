@@ -12,13 +12,14 @@ rust-sak = { version = "2", features = ["fetch"] }
 ```
 
 ```rust
-use rust_sak::fetch::{Fetch, RequestOptions, Response, Download, DownloadMode, DownloadError, DigestAlgorithm, Progress};
+use rust_sak::fetch::{Fetch, FetchError, RequestOptions, Response, Download, DownloadMode, DownloadError, DigestAlgorithm, Progress};
 ```
 
 ## Overview
 
 - **`Fetch`** — the client. Configure it **once** with a fluent builder, then **reuse** it for many requests. It lazily builds and caches an internal `reqwest::Client` (and its connection pool) on the first request.
 - **`RequestOptions`** — per-request overrides (method, query, headers, body, retries, download mode) that take priority over the `Fetch` defaults.
+- **`FetchError`** — what the `text`/`json` methods fail with: `Http(reqwest::Error)`, or `BodyTooLarge { limit }` when a body passes `max_body_bytes`. Non-exhaustive; `.status()` reads the HTTP status of a rejected response.
 - **`Download` / `Progress` / `DownloadMode` / `DownloadError`** — the streaming-download support returned by `Fetch::download`.
 - **`reqwest`** — re-exported, because this module's API is stated in its types (`reqwest::Error`, `StatusCode`, `HeaderMap`); name them as `rust_sak::fetch::reqwest::…` rather than depending on `reqwest` directly, which would risk two unrelated copies.
 - **`Response`** — a response with its metadata intact (body + status + headers), returned by the `*_response` methods, for when the answer is not only in the body.
@@ -38,6 +39,7 @@ These consume `self` and return `Self`, so chain them. Changing a client-build s
 | `.disable_http2(bool)`                       | `true` forces HTTP/1.x; `false` keeps HTTP/2.                                                                           |
 | `.read_timeout(impl Into<Option<Duration>>)` | Idle timeout per read — resets after each successful read, so it bounds stalls, not total duration. `None` disables it. |
 | `.download_mode(DownloadMode)`               | Default behavior when a download target already exists.                                                                 |
+| `.max_body_bytes(impl Into<Option<u64>>)`    | Cap on the body `text`/`json` read into memory; a larger one fails with `FetchError::BodyTooLarge`. `None` (default) reads any size. |
 | `.connect_timeout(impl Into<Option<Duration>>)` | Bound on establishing the connection (DNS + TCP + TLS), before any bytes move. `None` leaves it unbounded. |
 | `.proxy(ProxySettings)`                      | Route through an explicit proxy, overriding the environment and system settings.                                         |
 | `.no_proxy()`                                | Connect directly, ignoring **all** proxy configuration including `HTTPS_PROXY`.                                          |
@@ -63,7 +65,7 @@ let via_proxy = Fetch::new().proxy(
 let direct = Fetch::new().no_proxy();
 ```
 
-An invalid proxy URL is not rejected by `.proxy(...)`; it surfaces as the `reqwest::Error` from the first request, which is where the client is built.
+An invalid proxy URL is not rejected by `.proxy(...)`; it surfaces as the `reqwest::Error` inside the first request's `FetchError::Http` (or `DownloadError::Http`), which is where the client is built.
 
 `connect_timeout` bounds a different failure from `read_timeout`. `read_timeout` bounds how long an *established* connection may stall; a host that accepts nothing at all never reaches a read, so only `connect_timeout` bounds it.
 
@@ -78,15 +80,15 @@ let fetch = Fetch::new()
 
 ## `Fetch` — request methods
 
-All take `&self`. Each request method comes in two forms: a short form that uses default per-request options, and a `*_with_options` form that takes an explicit `RequestOptions`. The struct's defaults apply either way; anything set on `options` overrides them for that one call. Retries use Fibonacci backoff (1s, 2s, 3s, 5s, 8s, … capped at 60s) and apply **only to idempotent methods** (GET/HEAD/PUT/DELETE/OPTIONS/TRACE) unless `RequestOptions::retry_non_idempotent(true)` opts in.
+All take `&self`. Each request method comes in two forms: a short form that uses default per-request options, and a `*_with_options` form that takes an explicit `RequestOptions`. The struct's defaults apply either way; anything set on `options` overrides them for that one call. Retries use Fibonacci backoff (1s, 2s, 3s, 5s, 8s, … capped at 60s) and apply **only to idempotent methods** (GET/HEAD/PUT/DELETE/OPTIONS/TRACE) unless `RequestOptions::retry_non_idempotent(true)` opts in. Only failures another attempt could fix are retried — connection errors, timeouts, broken streams, `5xx`, `408` and `429` — and a `Retry-After` on a `429`/`503` (seconds or an HTTP date) replaces the Fibonacci wait, still capped at 60s.
 
 | Method                  | Signature                                                                                 | What it does                                                                                                                                                                                                                                    |
 |-------------------------|-------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `text`                  | `async fn text(&self, url) -> Result<String, reqwest::Error>`                             | Sends a `GET` with default options, returns the body as a `String`.                                                                                                                                                                            |
-| `text_with_options`     | `async fn text_with_options(&self, url, options) -> Result<String, reqwest::Error>`       | Same as `text` but applies the per-request `options`.                                                                                                                                                                                           |
-| `json`                  | `async fn json<T: DeserializeOwned>(&self, url) -> Result<T, reqwest::Error>`             | Same as `text` but deserializes the JSON body into `T`.                                                                                                                                                                                         |
+| `text`                  | `async fn text(&self, url) -> Result<String, FetchError>`                             | Sends a `GET` with default options, returns the body as a `String`.                                                                                                                                                                            |
+| `text_with_options`     | `async fn text_with_options(&self, url, options) -> Result<String, FetchError>`       | Same as `text` but applies the per-request `options`.                                                                                                                                                                                           |
+| `json`                  | `async fn json<T: DeserializeOwned>(&self, url) -> Result<T, FetchError>`             | Same as `text` but deserializes the JSON body into `T`.                                                                                                                                                                                         |
 | `json_with_options`     | `async fn json_with_options<T: DeserializeOwned>(&self, url, options) -> Result<T, …>`    | Same as `json` but applies the per-request `options`.                                                                                                                                                                                           |
-| `text_response`         | `async fn text_response(&self, url) -> Result<Response<String>, reqwest::Error>`          | Same as `text` but returns the whole `Response` — body, status and headers. See [Response metadata](#response-metadata).                                                                                        |
+| `text_response`         | `async fn text_response(&self, url) -> Result<Response<String>, FetchError>`          | Same as `text` but returns the whole `Response` — body, status and headers. See [Response metadata](#response-metadata).                                                                                        |
 | `text_response_with_options` | `async fn text_response_with_options(&self, url, options) -> Result<Response<String>, …>` | Same as `text_response` but applies the per-request `options`.                                                                                                                                            |
 | `json_response`         | `async fn json_response<T: DeserializeOwned>(&self, url) -> Result<Response<T>, …>`       | Same as `json` but returns the whole `Response`.                                                                                                                                                              |
 | `json_response_with_options` | `async fn json_response_with_options<T>(&self, url, options) -> Result<Response<T>, …>` | Same as `json_response` but applies the per-request `options`.                                                                                                                                              |
@@ -107,6 +109,7 @@ A consuming builder. Anything left unset is inherited from the `Fetch` struct. H
 | `.retry_non_idempotent(bool)`           | Allow retries for `POST`/`PATCH` etc. (off by default — re-sending a non-idempotent request risks a duplicate write). |
 | `.body<T: Serialize>(body)`             | Attach a JSON body, sent with `Content-Type: application/json`. **Panics** if not serializable.                       |
 | `.download_mode(DownloadMode)`          | Override the download mode (no effect on `text`/`json`).                                                              |
+| `.max_body_bytes(u64)`                  | Override the body size cap for this request (no effect on downloads).                                                 |
 | `.resume_key(impl Into<String>)`        | Identify a download's bytes beyond their URL, so a partial recorded under a different key is discarded rather than resumed. A pinned content hash is the natural value. |
 | `.digest(DigestAlgorithm)`              | Hash a download's bytes as they are written; read the result from `Download::digest()`. See [Content digests](#content-digests). |
 
@@ -135,7 +138,7 @@ that is eventually wrong, and silently returns a prefix when it is.
 ```rust,no_run
 use rust_sak::fetch::Fetch;
 
-# async fn run() -> Result<(), reqwest::Error> {
+# async fn run() -> Result<(), rust_sak::fetch::FetchError> {
 let fetch = Fetch::new();
 let mut url = Some("https://api.example.com/items?limit=50".to_string());
 let mut pages = Vec::new();
@@ -261,7 +264,7 @@ Dropping the handle does **not** cancel the download.
 | `.completed() -> bool`                                     | `true` once finished (success or failure).                                                                                                                                                                                                             |
 | `.failed() -> bool`                                        | `true` if finished with an error.                                                                                                                                                                                                                      |
 | `.changed() -> Result<(), RecvError>`                      | Await the next progress update.                                                                                                                                                                                                                        |
-| `.track(&mut self, callback) -> Result<(), DownloadError>` | Drive a `FnMut(Option<u64> total, u64 downloaded, Option<f64> fraction)` callback on every update, then resolve with the final result. **Borrows** the handle (stays usable after), but awaits the task **once** — do **not** call `join()` afterward. |
+| `.track(&mut self, callback) -> Result<(), DownloadError>` | Drive a `FnMut(Option<u64> total, u64 downloaded, Option<f64> fraction)` callback on every update, then resolve with the final result. **Borrows** the handle (stays usable after) and awaits the task **once**; a later `join()` reports the outcome without the original error. |
 | `.cancel(&self)`                                           | Abort the background task. The transfer then surfaces as `DownloadError::Cancelled`; `<path>.part` and its sidecar are left on disk (so a later `Resume` picks up where it stopped) but **nothing is left at the target path**.                        |
 | `.join(self) -> Result<(), DownloadError>`                 | Consume the handle and await the final result.                                                                                                                                                                                                         |
 
