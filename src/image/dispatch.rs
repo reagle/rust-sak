@@ -4,6 +4,7 @@ use std::sync::{Mutex, PoisonError};
 
 use ::image::codecs::jpeg::JpegEncoder;
 use ::image::codecs::png::PngEncoder;
+use ::image::metadata::Orientation;
 use ::image::{DynamicImage, ImageDecoder, ImageReader};
 
 use super::container;
@@ -162,7 +163,15 @@ pub(super) fn probe_native(reader: impl BufRead + Seek, format: ImageFormat) -> 
     // `into_decoder` parses the header only; `read_image` (never called here) is what decodes pixels.
     let mut decoder = ImageReader::with_format(reader, image_format).into_decoder()?;
 
-    let (width, height) = decoder.dimensions();
+    // The size the decode hands back, which is after the EXIF orientation: a frame stored on its side is reported
+    // upright, as `decode_with_format` returns it. An orientation that fails to read is taken as none.
+    let (mut width, mut height) = decoder.dimensions();
+    if matches!(
+        decoder.orientation(),
+        Ok(Orientation::Rotate90 | Orientation::Rotate270 | Orientation::Rotate90FlipH | Orientation::Rotate270FlipH)
+    ) {
+        std::mem::swap(&mut width, &mut height);
+    }
     let color_type = decoder.color_type();
     let bit_depth = (color_type.bits_per_pixel() / color_type.channel_count() as u16) as u8;
     // Every native decoder has the profile in hand once the header is parsed (JPEG `APP2`, PNG `iCCP`, TIFF tag

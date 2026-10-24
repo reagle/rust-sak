@@ -176,6 +176,8 @@ pub struct ImageInfo {
 }
 ```
 
+`width` and `height` are the size the image decodes to. For BMP, GIF, JPEG, PNG and TIFF that is after the EXIF orientation, which the decoders apply: a portrait photograph stored on its side is reported upright.
+
 `bit_depth` carries the true per-channel depth — important for high-bit-depth AVIF/HEIF (10/12-bit), which `color_type` alone cannot tell apart from 16-bit.
 
 `color_profile` names the profile the file declares, read from the header like everything else here:

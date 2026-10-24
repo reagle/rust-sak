@@ -1820,7 +1820,7 @@ mod raw {
 }
 
 #[test]
-fn a_jpeg_decodes_upright_from_its_exif_orientation() {
+fn a_jpeg_decodes_and_probes_upright_from_its_exif_orientation() {
     use ::image::ImageEncoder;
     use ::image::codecs::jpeg::JpegEncoder;
 
@@ -1846,4 +1846,19 @@ fn a_jpeg_decodes_upright_from_its_exif_orientation() {
         (2, 4),
         "the stored 4x2 frame was not turned upright"
     );
+
+    // The probe has to agree with the decode, or a listing shows a portrait photograph at a landscape size.
+    let info = probe_bytes(&jpeg).unwrap();
+    assert_eq!(
+        (info.width, info.height),
+        (2, 4),
+        "probe_bytes reported the stored size"
+    );
+
+    let path = std::env::temp_dir().join(format!("rust_sak_oriented_{}.jpg", std::process::id()));
+    std::fs::write(&path, &jpeg).unwrap();
+    let info = probe_file(&path);
+    std::fs::remove_file(&path).unwrap();
+    let info = info.unwrap();
+    assert_eq!((info.width, info.height), (2, 4), "probe_file reported the stored size");
 }
