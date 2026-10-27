@@ -287,7 +287,8 @@ fn with_extended(standard: &[u8], chunks: &[(&[u8], u32, u32, &[u8])]) -> Vec<u8
 /// gain map's offset.
 ///
 /// An ISO payload too large for one segment, or a gain map that is not a complete JPEG (`SOI` to a final `EOI`), is
-/// left out and reported unwritten; so is the gain map when `encoded` does not end at its `EOI`.
+/// left out and reported unwritten; so is the gain map when `encoded` does not end at its `EOI`, or when the XMP that
+/// declares it could not keep that declaration in the standard packet and there is no ISO payload to declare it instead.
 pub(super) fn splice(encoded: &[u8], blocks: ToWrite<'_>) -> Option<(Vec<u8>, Wrote)> {
     let first = segments(encoded).next();
     // The `JFIF` (or `JFXX`) segment, which must stay first.
@@ -304,11 +305,14 @@ pub(super) fn splice(encoded: &[u8], blocks: ToWrite<'_>) -> Option<(Vec<u8>, Wr
         push_segment(&mut inserted, APP1, &[EXIF_HEADER, block]);
         wrote.exif = true;
     }
+    // Whether a gain map's `hdrgm` declaration, if the XMP has one, is where readers look for it: the standard packet.
+    let mut declared = true;
     if let Some(packet) = blocks.xmp {
         if packet.len() <= xmp::MAX_STANDARD_LEN {
             push_segment(&mut inserted, APP1, &[XMP_HEADER, packet]);
         } else {
             let (standard, guid, extended) = xmp::split(packet);
+            declared = !xmp::contains(packet, HDRGM_NAMESPACE) || xmp::contains(&standard, HDRGM_NAMESPACE);
             push_segment(&mut inserted, APP1, &[XMP_HEADER, &standard]);
             let full = u32::try_from(extended.len()).ok()?.to_be_bytes();
             for (index, chunk) in extended.chunks(EXTENDED_CHUNK_LEN).enumerate() {
@@ -335,9 +339,13 @@ pub(super) fn splice(encoded: &[u8], blocks: ToWrite<'_>) -> Option<(Vec<u8>, Wr
         push_segment(&mut inserted, APP2, &[ISO_GAIN_MAP_HEADER, payload]);
         wrote.iso_gain_map = true;
     }
+    // A gain map whose `hdrgm` XMP had to go into extended XMP (only where a split cannot keep it standard), with no
+    // ISO 21496-1 version marker beside it, is declared nowhere a reader looks: it is left out rather than appended
+    // unseen.
     let gain_map = blocks
         .gain_map
-        .filter(|image| is_complete(image) && is_complete(encoded));
+        .filter(|image| is_complete(image) && is_complete(encoded))
+        .filter(|_| declared || wrote.iso_gain_map);
     // Where the index segment starts in the output.
     let index_at = gain_map.map(|_| {
         let at = insert_at + inserted.len();
