@@ -29,7 +29,8 @@ pub struct Metadata {
     pub exif: Option<Vec<u8>>,
     /// An XMP packet: one whole serialized `x:xmpmeta` document, normally wrapped in `<?xpacket?>` instructions, in
     /// UTF-8. A JPEG source's extended XMP has already been merged into it. Embedded in JPEG (`APP1`, re-split into
-    /// standard and extended XMP above 65,502 bytes), PNG (`iTXt` with keyword `XML:com.adobe.xmp`) and WebP (`XMP `).
+    /// standard and extended XMP above 65,502 bytes: the largest properties move, and the gain-map declaration and its
+    /// container directory stay standard), PNG (`iTXt` with keyword `XML:com.adobe.xmp`) and WebP (`XMP `).
     pub xmp: Option<Vec<u8>>,
     /// A Photoshop image-resource block (a sequence of `8BIM` resources), as a JPEG carries it in `APP13`
     /// `Photoshop 3.0`. The IPTC-IIM data is its resource `0x0404`. Embedded in JPEG only (split across `APP13`

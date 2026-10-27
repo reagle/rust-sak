@@ -438,6 +438,116 @@ fn the_segments_are_in_the_documented_order() {
     assert_eq!(found, ["JFIF", "EXIF", "XMP", "ISO", "MPF", "ICC"]);
 }
 
+/// The data of the `APP1` segments of the JPEG `file` ahead of its first scan, in order.
+fn app1_segments(file: &[u8]) -> Vec<&[u8]> {
+    let mut found = Vec::new();
+    let mut at = 2;
+    while file[at + 1] != 0xDA {
+        let length = usize::from(u16::from_be_bytes([file[at + 2], file[at + 3]]));
+        if file[at + 1] == 0xE1 {
+            found.push(&file[at + 4..at + 2 + length]);
+        }
+        at += 2 + length;
+    }
+    found
+}
+
+/// [`PRIMARY_XMP`] with a Pixel's 93 kB `GCamera:HdrPlusMakernote` in a description of its own, and a Google container
+/// directory beside `hdrgm:Version`.
+fn pixel_xmp() -> Vec<u8> {
+    let makernote = format!(
+        r#"<rdf:Description rdf:about="" xmlns:GCamera="http://ns.google.com/photos/1.0/camera/"><GCamera:HdrPlusMakernote>{}</GCamera:HdrPlusMakernote></rdf:Description>"#,
+        "A".repeat(93_282)
+    );
+    let directory = r#" xmlns:Container="http://ns.google.com/photos/1.0/container/" xmlns:Item="http://ns.google.com/photos/1.0/container/item/" hdrgm:Version="1.0"><Container:Directory><rdf:Seq><rdf:li rdf:parseType="Resource"><Container:Item Item:Semantic="Primary" Item:Mime="image/jpeg"/></rdf:li></rdf:Seq></Container:Directory></rdf:Description>"#;
+    let packet = std::str::from_utf8(PRIMARY_XMP)
+        .unwrap()
+        .replacen(r#" hdrgm:Version="1.0"/>"#, directory, 1);
+    packet
+        .replacen("</rdf:RDF>", &format!("{makernote}</rdf:RDF>"), 1)
+        .into_bytes()
+}
+
+#[test]
+fn an_xmp_packet_too_large_for_one_segment_keeps_the_gain_map_declared_in_the_standard_one() {
+    let packet = pixel_xmp();
+    assert!(packet.len() > super::xmp::MAX_STANDARD_LEN);
+    for iso in [Some(VERSION.to_vec()), None] {
+        let metadata = Metadata {
+            xmp: Some(packet.clone()),
+            iso_gain_map: iso.clone(),
+            ..ultra_hdr_metadata()
+        };
+
+        let (file, embedded) = encode(&metadata, ImageFormat::Jpeg);
+
+        assert!(embedded.xmp && embedded.gain_map, "iso: {iso:?}");
+        // The standard segment fits and declares the gain map and its directory; two extended chunks carry the
+        // makernote, each within a segment, under the GUID the standard packet names, which is the MD5 of their whole.
+        let segments = app1_segments(&file);
+        let standard = segments[0]
+            .strip_prefix(b"http://ns.adobe.com/xap/1.0/\0".as_slice())
+            .unwrap();
+        let text = std::str::from_utf8(standard).unwrap();
+        assert!(standard.len() <= super::xmp::MAX_STANDARD_LEN);
+        assert!(
+            text.contains(r#"hdrgm:Version="1.0""#) && text.contains("<Container:Directory>"),
+            "{text}"
+        );
+        assert!(!text.contains("HdrPlusMakernote"));
+        let guid = super::xmp::extended_guid(standard).unwrap();
+        let chunks: Vec<_> = segments[1..]
+            .iter()
+            .map(|data| {
+                data.strip_prefix(b"http://ns.adobe.com/xmp/extension/\0".as_slice())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(chunks.len(), 2);
+        let whole: Vec<u8> = chunks.iter().flat_map(|chunk| chunk[40..].iter().copied()).collect();
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(&chunk[..32], guid.as_bytes());
+            assert_eq!(
+                u32::from_be_bytes(chunk[32..36].try_into().unwrap()) as usize,
+                whole.len()
+            );
+            let offset = u32::from_be_bytes(chunk[36..40].try_into().unwrap()) as usize;
+            assert_eq!(offset, if index == 0 { 0 } else { chunks[0].len() - 40 });
+        }
+        assert_eq!(format!("{:X}", md5::compute(&whole)), guid);
+        assert!(std::str::from_utf8(&whole).unwrap().contains(&"A".repeat(93_282)));
+
+        // Read back: one packet with everything, the gain map found by its index, the file HDR.
+        let read = metadata_bytes(&file);
+        let joined = String::from_utf8(read.xmp.unwrap()).unwrap();
+        assert!(joined.contains(&"A".repeat(93_282)) && joined.contains(r#"hdrgm:Version="1.0""#));
+        assert!(!joined.contains("HasExtendedXMP"));
+        assert_eq!(read.gain_map, metadata.gain_map);
+        assert_eq!(hdr_bytes(&file), Some(Hdr::GainMap));
+    }
+}
+
+#[test]
+fn a_gain_map_whose_declaration_must_go_into_extended_xmp_needs_the_iso_marker_to_be_written() {
+    // `hdrgm:Version` alone too large for the standard segment: the packet is split whole.
+    let packet = std::str::from_utf8(PRIMARY_XMP).unwrap().replace(
+        r#"hdrgm:Version="1.0""#,
+        &format!(r#"hdrgm:Version="1.0{}""#, " ".repeat(70_000)),
+    );
+    for (iso, written) in [(Some(VERSION.to_vec()), true), (None, false)] {
+        let metadata = Metadata {
+            xmp: Some(packet.clone().into_bytes()),
+            iso_gain_map: iso,
+            ..ultra_hdr_metadata()
+        };
+        let (file, embedded) = encode(&metadata, ImageFormat::Jpeg);
+        assert!(embedded.xmp, "the XMP is still written, whole");
+        assert_eq!(embedded.gain_map, written);
+        assert_eq!(metadata_bytes(&file).gain_map.is_some(), written);
+        assert_eq!(file.windows(4).any(|w| w == b"MPF\0"), written);
+    }
+}
+
 #[test]
 fn a_gain_map_that_is_not_a_whole_jpeg_or_an_oversized_iso_payload_is_left_out() {
     for broken in [b"not a jpeg".to_vec(), {
